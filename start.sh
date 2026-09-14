@@ -1,5 +1,4 @@
 #!/bin/sh
-# 同时启动 cloudflared 隧道 和 CPA 主程序
 set -e
 
 echo "[start.sh] 容器启动..."
@@ -14,8 +13,8 @@ else
     echo "[start.sh] 警告:未设置 CLOUDFLARE_TUNNEL_TOKEN,跳过隧道(服务将无法通过域名访问)"
 fi
 
-# ---- 2. 启动 CPA 主程序(前台)----
-# 直接调用官方镜像里的入口程序,让 CPA 成为容器主进程
+# ---- 2. 启动 cctool 主程序(前台)----
+# 直接调用官方镜像里的入口程序,让 cctool 成为容器主进程
 echo "[start.sh] 启动 cctool..."
 
 npm start
