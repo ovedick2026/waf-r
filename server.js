@@ -1184,7 +1184,8 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
         max_tokens: 8192,
         messages: [{ role: 'user', content: prompt }],
         stream: true
-      })
+      }),
+      signal
     });
 
     if (res.ok) {
@@ -1215,7 +1216,8 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
       model: model || 'claude-3-7-sonnet-20250219',
       messages: [{ role: 'user', content: prompt }],
       stream: true
-    })
+    }),
+    signal
   });
 
   if (!chatRes.ok) {
@@ -1374,10 +1376,24 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
   const { model, messages, stream } = req.body;
 
+  const upstreamAbort = new AbortController();
+  let finished = false;
+
+  const abortUpstream = () => {
+    if (!finished && !upstreamAbort.signal.aborted) {
+      upstreamAbort.abort();
+      logger.debug('下游连接断开，已取消上游请求', {
+        目标上游: upstreamBase
+      });
+    }
+  };
+
+  req.on('close', abortUpstream);
+  res.on('close', abortUpstream);
+
   const isCompacting = isCompactionRequest(messages);
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
-  // 这里只作为调试观察：Claude Code 原始请求体估算
   const rawRequestTokens = estimateTokensFromPayload(req.body || {});
 
   logger.debug('收到 Claude Code 调度请求', {
@@ -1388,12 +1404,30 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     '本次增量输入': latestTurnInput || '（初始启动任务）'
   });
 
+  let prompt = '';
+  if (isCompacting) {
+    prompt = `请对以下任务流水线当前的历史进展提供一份结构化、简明扼要的摘要总结，包括：已完成的步骤、生成/修改的文件清单、关键错误/测试结果、用户问答选择、以及当前待推进的下一个阶段。注意：用户问答选择必须完整保留，不得改写含义。请直接给出总结文本：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`;
+  } else {
+    prompt = buildPrompt(globalTask, historyLogsText);
+  }
+
+  const requestInputTokens = estimateTokensFromText(prompt);
+
+  logger.debug('中介实际上游Prompt', {
+    'Prompt字符数': prompt.length,
+    '实际上游Prompt估算Token': requestInputTokens
+  });
+
+  prompt = limitProxyPrompt(prompt);
+
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   let heartbeatTimer = null;
   let blockIndex = 0;
 
   const sendSSE = (ev, data) => {
-    if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (!res.writableEnded) {
+      res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
   };
 
   if (stream) {
@@ -1419,36 +1453,22 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       }
     });
 
+    // 关键：发真正 Anthropic SSE ping，不发注释
     heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) res.write(': keep-alive\n\n');
-    }, 5000);
+      if (!res.writableEnded) {
+        sendSSE('ping', { type: 'ping' });
+      }
+    }, 15000);
   }
 
   try {
-    let prompt = '';
-    if (isCompacting) {
-      prompt = `请对以下任务流水线当前的历史进展提供一份结构化、简明扼要的摘要总结，包括：已完成的步骤、生成/修改的文件清单、关键错误/测试结果、用户问答选择、以及当前待推进的下一个阶段。注意：用户问答选择必须完整保留，不得改写含义。请直接给出总结文本：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`;
-    } else {
-      prompt = buildPrompt(globalTask, historyLogsText);
-    }
-
-    // 关键：返回给 Claude Code 的 usage 应该按中介实际发给 LLM 的 prompt 算
-    const requestInputTokens = estimateTokensFromText(prompt);
-
-    logger.debug('中介实际上游Prompt', {
-      'Prompt字符数': prompt.length,
-      '实际上游Prompt估算Token': requestInputTokens
-    });
-
-    prompt = limitProxyPrompt(prompt);
-
-    // 关键：不接收/不转发 thinking chunk
     const { text: assistantText } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
       prompt,
-      null
+      null,
+      upstreamAbort.signal
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -1551,18 +1571,20 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         }
       });
       sendSSE('message_stop', { type: 'message_stop' });
+
+      finished = true;
       res.end();
     } else {
-      const content = [];
-      if (textContent) content.push({ type: 'text', text: textContent });
-      if (toolBlock) content.push(toolBlock);
-
+      finished = true;
       res.json({
         id: msgId,
         type: 'message',
         role: 'assistant',
         model,
-        content,
+        content: [
+          ...(textContent ? [{ type: 'text', text: textContent }] : []),
+          ...(toolBlock ? [toolBlock] : [])
+        ],
         stop_reason: stopReason,
         stop_sequence: null,
         usage: {
@@ -1573,9 +1595,25 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+    if (upstreamAbort.signal.aborted) {
+      logger.debug('上游请求已因下游断开而中止', {
+        目标上游: upstreamBase
+      });
+      return;
+    }
+
     logger.error('Claude Code 消息通道异常', err.message);
-    if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
-    else res.end();
+
+    finished = true;
+    if (!res.headersSent) {
+      res.status(500).json({ error: { message: err.message } });
+    } else {
+      res.end();
+    }
+  } finally {
+    req.off?.('close', abortUpstream);
+    res.off?.('close', abortUpstream);
   }
 });
 
@@ -1590,9 +1628,24 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
   const { model, messages, stream } = req.body;
+
+  const upstreamAbort = new AbortController();
+  let finished = false;
+
+  const abortUpstream = () => {
+    if (!finished && !upstreamAbort.signal.aborted) {
+      upstreamAbort.abort();
+      logger.debug('下游连接断开，已取消上游请求', {
+        目标上游: upstreamBase
+      });
+    }
+  };
+
+  req.on('close', abortUpstream);
+  res.on('close', abortUpstream);
+
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
-  // 这里只作为调试观察：Claude Code/OpenAI 客户端原始请求体估算
   const rawRequestTokens = estimateTokensFromPayload(req.body || {});
 
   logger.debug('收到 OpenAI/ChatCompletions 调度请求', {
@@ -1600,16 +1653,30 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     原始请求估算Token: rawRequestTokens,
     本次增量输入: latestTurnInput || '（初始启动任务）'
   });
-  
+
   let heartbeatTimer = null;
+
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
+
+    // 关键：OpenAI 兼容流发空 delta，不发 SSE 注释
     heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) res.write(': keep-alive\n\n');
-    }, 5000);
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-keepalive',
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            delta: {}
+          }]
+        })}\n\n`);
+      }
+    }, 15000);
   }
 
   try {
@@ -1622,13 +1689,13 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       实际上游Prompt估算Token: requestInputTokens
     });
 
-    // 关键：只取 text，不要使用 thinking
     const { text: assistantText } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
       prompt,
-      null
+      null,
+      upstreamAbort.signal
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -1643,7 +1710,6 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
       finishReason = 'tool_calls';
 
-      // 关键：不要 parsedAction.thought，否则模板里的【思考】正文也会进入历史
       const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
       textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
 
@@ -1715,8 +1781,11 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       })}\n\n`);
 
       res.write('data: [DONE]\n\n');
+
+      finished = true;
       res.end();
     } else {
+      finished = true;
       res.json({
         id: 'chatcmpl-' + crypto.randomBytes(8).toString('hex'),
         object: 'chat.completion',
@@ -1740,9 +1809,25 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+    if (upstreamAbort.signal.aborted) {
+      logger.debug('上游请求已因下游断开而中止', {
+        目标上游: upstreamBase
+      });
+      return;
+    }
+
     logger.error('ChatCompletions 消息通道异常', err.message);
-    if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
-    else res.end();
+
+    finished = true;
+    if (!res.headersSent) {
+      res.status(500).json({ error: { message: err.message } });
+    } else {
+      res.end();
+    }
+  } finally {
+    req.off?.('close', abortUpstream);
+    res.off?.('close', abortUpstream);
   }
 });
 
