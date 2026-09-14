@@ -1122,6 +1122,16 @@ function scanBalancedJsonObject(text) {
   return null;
 }
 
+function assertNonEmptyUpstreamText(text, scene = '调度') {
+  const clean = String(text || '').trim();
+
+  if (!clean) {
+    throw new Error(`上游 LLM 返回空内容，${scene}失败，不能伪造为任务已完成`);
+  }
+
+  return clean;
+}
+
 function extractActionAndThought(rawText) {
   if (!rawText || typeof rawText !== 'string') return null;
   let thought = '';
@@ -1525,43 +1535,57 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       null,
       upstreamAbort.signal
     );
-
+    
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-
+    
+    const safeAssistantText = assertNonEmptyUpstreamText(
+      assistantText,
+      isCompacting ? '历史压缩' : '任务调度'
+    );
+    
     let stopReason = 'end_turn';
     let textContent = '';
     let toolBlock = null;
-
+    
     if (isCompacting) {
-      textContent = assistantText
+      textContent = safeAssistantText
         .replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '')
-        .trim() || '流水线历史状态已压缩归纳。';
+        .trim();
+    
+      if (!textContent) {
+        throw new Error('上游 LLM 历史压缩结果为空');
+      }
+    
       stopReason = 'end_turn';
     } else {
-      const parsedAction = extractActionAndThought(assistantText);
-
+      const parsedAction = extractActionAndThought(safeAssistantText);
+    
       if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
         const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
         stopReason = 'tool_use';
-
+    
         const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
         textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
-
+    
         toolBlock = {
           type: 'tool_use',
           id: 'toolu_' + crypto.randomBytes(10).toString('hex'),
           name: mappedTool.name,
           input: mappedTool.arguments
         };
-
+    
         logger.debug('成功装配 CC 原生工具调用', {
           '耗时': `${Date.now() - startTime}ms`,
           '下发原生工具': mappedTool.name,
           '参数大小': `${JSON.stringify(mappedTool.arguments).length} 字符`
         });
-      } else {
-        textContent = parsedAction?.params?.summary || '任务已完成。';
+      } else if (parsedAction && parsedAction.action === 'finish') {
+        textContent = parsedAction.params?.summary || '任务已完成。';
         stopReason = 'end_turn';
+      } else {
+        throw new Error(
+          `上游 LLM 输出无法解析为有效调度动作，不能当作任务完成。原始输出：${safeAssistantText.slice(0, 500)}`
+        );
       }
     }
 
@@ -1753,22 +1777,24 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       null,
       upstreamAbort.signal
     );
-
+    
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-
-    const parsedAction = extractActionAndThought(assistantText);
+    
+    const safeAssistantText = assertNonEmptyUpstreamText(assistantText, '任务调度');
+    const parsedAction = extractActionAndThought(safeAssistantText);
+    
     const callId = 'call_' + crypto.randomBytes(8).toString('hex');
     let toolCalls = null;
     let finishReason = 'stop';
     let textContent = '';
-
+    
     if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
       const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
       finishReason = 'tool_calls';
-
+    
       const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
       textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
-
+    
       toolCalls = [{
         index: 0,
         id: callId,
@@ -1778,9 +1804,13 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
           arguments: JSON.stringify(mappedTool.arguments)
         }
       }];
-    } else {
-      textContent = parsedAction?.params?.summary || '任务已完成。';
+    } else if (parsedAction && parsedAction.action === 'finish') {
+      textContent = parsedAction.params?.summary || '任务已完成。';
       finishReason = 'stop';
+    } else {
+      throw new Error(
+        `上游 LLM 输出无法解析为有效调度动作，不能当作任务完成。原始输出：${safeAssistantText.slice(0, 500)}`
+      );
     }
 
     const outputTokens =
