@@ -640,8 +640,17 @@ function normalizeUserAnswerText(text) {
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
 
+  if (validSteps.length === 0) {
+    return '（当前为初始化阶段，尚无历史记录）';
+  }
+
+  const latestOriginalIdx = validSteps.length - 1;
   const mustKeepIndexes = new Set();
 
+  // 1. 最后一步无条件保留
+  mustKeepIndexes.add(latestOriginalIdx);
+
+  // 2. 用户问答、核心上下文必须保留
   validSteps.forEach((s, idx) => {
     const retention = classifyStepRetention(s.action, s.params || {}, s.feedback || '');
     if (
@@ -652,7 +661,8 @@ function compressHistorySteps(rawSteps) {
       mustKeepIndexes.add(idx);
     }
   });
-  //上下文轮数修改，最近6轮保留
+
+  // 3. 最近 6 轮保留
   const recentStart = Math.max(0, validSteps.length - 6);
   for (let i = recentStart; i < validSteps.length; i++) {
     mustKeepIndexes.add(i);
@@ -670,6 +680,7 @@ function compressHistorySteps(rawSteps) {
     'code_audit'
   ]);
 
+  // 4. 错误步骤强制保留
   validSteps.forEach((s, idx) => {
     if (!importantActions.has(s.action)) return;
     const feedback = String(s.feedback || '');
@@ -678,8 +689,21 @@ function compressHistorySteps(rawSteps) {
     }
   });
 
+  // 5. 统计每个文件最后一次读取，基于完整 validSteps，不基于渲染列表
+  const lastReadOriginalMap = new Map();
+
+  validSteps.forEach((s, originalIdx) => {
+    if (s.action === 'fs_read') {
+      const fp = String(s.params?.file_path || s.params?.path || '').toLowerCase();
+      if (fp) {
+        lastReadOriginalMap.set(fp, originalIdx);
+      }
+    }
+  });
+
   const selectedIndexes = [...mustKeepIndexes].sort((a, b) => a - b);
-  //最大上下文保留轮数，当前为10轮
+
+  // 最大上下文保留轮数
   const maxHistorical = 10;
   let indexesToRender = selectedIndexes;
 
@@ -687,23 +711,23 @@ function compressHistorySteps(rawSteps) {
     const must = selectedIndexes.filter(i => {
       const s = validSteps[i];
       const retention = classifyStepRetention(s.action, s.params || {}, s.feedback || '');
-      return retention.tier === 'must_keep_full' || retention.tier === 'core_context' || i >= recentStart;
+      return (
+        retention.tier === 'must_keep_full' ||
+        retention.tier === 'core_context' ||
+        i >= recentStart ||
+        i === latestOriginalIdx
+      );
     });
+
     const rest = selectedIndexes.filter(i => !must.includes(i));
-    indexesToRender = [...rest.slice(-(maxHistorical - must.length)), ...must].sort((a, b) => a - b);
-  }
 
-  if (indexesToRender.length === 0) {
-    return '（当前为初始化阶段，尚无历史记录）';
-  }
+    const restRoom = Math.max(0, maxHistorical - must.length);
 
-  const lastReadMap = new Map();
-  indexesToRender.forEach((originalIdx, renderIdx) => {
-    const s = validSteps[originalIdx];
-    if (s.action === 'fs_read' && s.params?.file_path) {
-      lastReadMap.set(String(s.params.file_path).toLowerCase(), renderIdx);
-    }
-  });
+    indexesToRender = [
+      ...rest.slice(-restRoom),
+      ...must
+    ].sort((a, b) => a - b);
+  }
 
   const omittedCount = validSteps.length - indexesToRender.length;
   const total = indexesToRender.length;
@@ -717,19 +741,40 @@ function compressHistorySteps(rawSteps) {
     const isTodoFile = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(filePathStr);
     const isReadmeFile = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(filePathStr);
 
-    const stepAge = total - 1 - renderIdx;
-    const isLatestStep = stepAge === 0;
+    // 注意：这里用原始索引算 age，不用 renderIdx
+    const stepAge = latestOriginalIdx - originalIdx;
+    const isLatestStep = originalIdx === latestOriginalIdx;
+
     const retention = classifyStepRetention(step.action, params, feedback);
 
     if (step.action === 'fs_read') {
       const lowerPath = filePathStr.toLowerCase();
-      if (lastReadMap.get(lowerPath) !== renderIdx && !isTodoFile && !isReadmeFile) {
+      const latestReadOriginalIdx = lastReadOriginalMap.get(lowerPath);
+
+      // 最后一步：不管是什么，绝不压缩
+      if (isLatestStep) {
+        feedback = sanitizeWhitespace(String(feedback));
+      }
+      // 普通文件读取：后面有同文件更新读取，则旧的折叠
+      else if (
+        latestReadOriginalIdx !== undefined &&
+        latestReadOriginalIdx > originalIdx &&
+        !isTodoFile &&
+        !isReadmeFile
+      ) {
         feedback = `[早期版本已读取，后续有同文件最新读取结果，此处折叠。文件：${filePathStr}]`;
-      } else {
+      }
+      // 其他读取正常压缩
+      else {
         feedback = formatLocalFeedback(feedback, 'fs_read', params, isLatestStep, stepAge);
       }
     } else {
-      feedback = formatLocalFeedback(feedback, step.action, params, isLatestStep, stepAge);
+      // 最后一步：不管是什么，绝不压缩
+      if (isLatestStep) {
+        feedback = sanitizeWhitespace(String(feedback));
+      } else {
+        feedback = formatLocalFeedback(feedback, step.action, params, isLatestStep, stepAge);
+      }
     }
 
     return `--- Step ${renderIdx + 1} / 原始第 ${originalIdx + 1} 步 ---
@@ -745,10 +790,16 @@ ${feedback}`;
   }).join('\n\n');
 
   const finalText = omittedCount > 0
-    ? `【历史压缩说明】：原始共有 ${validSteps.length} 个工具/问答步骤，已智能保留 ${indexesToRender.length} 个关键步骤，折叠 ${omittedCount} 个低价值或过旧步骤；用户问答、todo/readme、错误、测试、文件变更均优先保留。\n\n${rendered}`
+    ? `【历史压缩说明】：原始共有 ${validSteps.length} 个工具/问答步骤，已智能保留 ${indexesToRender.length} 个关键步骤，折叠 ${omittedCount} 个低价值或过旧步骤；用户问答、todo/readme、错误、测试、文件变更均优先保留，最后一步永不压缩。\n\n${rendered}`
     : rendered;
 
-  return hardLimitText(finalText, MAX_HISTORY_CHARS, '历史执行记录');
+  // 关键：不要用 hardLimitText 的 head/tail，否则可能破坏最新步骤。
+  // 这里强制保留尾部，也就是最新历史。
+  if (finalText.length <= MAX_HISTORY_CHARS) {
+    return finalText;
+  }
+
+  return `【历史过长，已保留最新部分，避免截断最后一步】\n\n${finalText.slice(-MAX_HISTORY_CHARS)}`;
 }
 
 function parseConversation(messages = []) {
