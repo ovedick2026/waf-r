@@ -1,0 +1,19 @@
+{
+  "name": "cctool2",
+  "version": "1.0.0",
+  "description": "cctool2",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "undici": "^6.21.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
