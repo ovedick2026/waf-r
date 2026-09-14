@@ -1165,7 +1165,7 @@ async function* readSSE(response) {
   }
 }
 
-async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinkingChunk) {
+async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinkingChunk, signal) {
   const headers = {
     'Content-Type': 'application/json',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -1388,7 +1388,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     }
   };
 
-  req.on('close', abortUpstream);
+  // req.on('close', abortUpstream);
   res.on('close', abortUpstream);
 
   const isCompacting = isCompactionRequest(messages);
@@ -1453,12 +1453,16 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       }
     });
 
-    // 关键：发真正 Anthropic SSE ping，不发注释
     heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) {
-        sendSSE('ping', { type: 'ping' });
-      }
-    }, 15000);
+      if (!res.writableEnded) res.write(': keep-alive\n\n');
+    }, 5000);
+
+    // 关键：发真正 Anthropic SSE ping，不发注释
+    // heartbeatTimer = setInterval(() => {
+    //   if (!res.writableEnded) {
+    //     sendSSE('ping', { type: 'ping' });
+    //   }
+    // }, 15000);
   }
 
   try {
@@ -1597,7 +1601,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
     if (upstreamAbort.signal.aborted) {
-      logger.debug('上游请求已因下游断开而中止', {
+      logger.debug('v1/message上游请求已因下游断开而中止', {
         目标上游: upstreamBase
       });
       return;
@@ -1612,7 +1616,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       res.end();
     }
   } finally {
-    req.off?.('close', abortUpstream);
+    logger.debug('v1/message 下游断开!!!');
+    // req.off?.('close', abortUpstream);
     res.off?.('close', abortUpstream);
   }
 });
@@ -1641,7 +1646,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     }
   };
 
-  req.on('close', abortUpstream);
+  // req.on('close', abortUpstream);
   res.on('close', abortUpstream);
 
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
@@ -1676,7 +1681,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
           }]
         })}\n\n`);
       }
-    }, 15000);
+    }, 5000);
   }
 
   try {
@@ -1826,7 +1831,8 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       res.end();
     }
   } finally {
-    req.off?.('close', abortUpstream);
+    logger.debug('/v1/chat/completions下游断开!!!');
+    // req.off?.('close', abortUpstream);
     res.off?.('close', abortUpstream);
   }
 });
