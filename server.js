@@ -1167,7 +1167,7 @@ function assertNonEmptyUpstreamText(text, scene = '调度') {
   const clean = String(text || '').trim();
 
   if (!clean) {
-    throw new Error(`上游 LLM 返回空内容，${scene}失败，不能伪造为任务已完成`);
+    throw new Error("上游 LLM 返回空内容，${scene}失败，不能伪造为任务已完成");
   }
 
   return clean;
