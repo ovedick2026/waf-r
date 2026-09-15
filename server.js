@@ -1072,7 +1072,7 @@ function buildPrompt(globalTask, historyLogsText) {
 5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n，不要打回车换行）。
 
 【强制返回格式模板示例】:
-【思考】: 说明当前步骤的意图与判断分析...
+【思考】: 用一句自然语言简明扼要说明当前步骤的意图与判断分析...
 【调度动作】: fs_write
 \`\`\`json
 {
@@ -1607,7 +1607,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         stopReason = 'tool_use';
     
         const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
-        textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
+        // textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
+        textContent = (parsedAction.thought || `执行 ${mappedTool.name}`).slice(0, 300);
     
         toolBlock = {
           type: 'tool_use',
@@ -1835,7 +1836,8 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       finishReason = 'tool_calls';
     
       const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
-      textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
+      // textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
+      textContent = (parsedAction.thought || `执行 ${mappedTool.name}`).slice(0, 300);
     
       toolCalls = [{
         index: 0,
