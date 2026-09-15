@@ -841,6 +841,40 @@ function parseConversation(messages = []) {
   }
   if (!globalTask) globalTask = '推进当前工作目录下的任务推进。';
 
+  // 最新用户中途消息：解决“用户想先沟通，但系统继续死板推进”的问题
+  // 只取第 2 条之后的普通 user 文本，避免把初始任务当成打断消息
+  let latestUserMessage = '';
+
+  for (let i = messages.length - 1; i >= 1; i--) {
+    const msg = messages[i];
+    if (msg.role !== 'user') continue;
+
+    const rawText = stringifyUserContent(msg.content);
+    const clean = cleanNoise(rawText);
+
+    if (
+      clean &&
+      !clean.startsWith('<tool_result') &&
+      !clean.includes("Today's date is") &&
+      !/^\s*\{[\s\S]*\}\s*$/.test(clean) &&
+      !/^\s*(selected|answer|choice|option|确认|取消|yes|no)\s*[:：]/i.test(clean)
+    ) {
+      latestUserMessage = hardLimitText(clean, 6000, '最新用户中途消息');
+      break;
+    }
+  }
+
+  if (latestUserMessage) {
+    globalTask = `${globalTask}
+
+【最新用户中途消息，最高优先级】：
+${latestUserMessage}
+
+【中途消息处理要求】：
+如果这条消息是在沟通方案、补充需求、修改方向、暂停执行、提问、纠正、吐槽、要求确认，必须先响应用户，不得继续推进旧计划。
+如果这条消息明确表示“继续、按方案执行、确认、可以、开始”，才允许继续执行下一步。`;
+  }
+
   const pendingSteps = new Map();
   const sequentialQueue = [];
   let awaitingUserAnswerStep = null;
@@ -1031,7 +1065,7 @@ function buildPrompt(globalTask, historyLogsText) {
 【流水线设计约束】：
 1. 拆解规范：当工作流初次启动（无历史记录）时，先检查本地目录是否有 todo.md 和 readme.md 文件：
 - 若都有，检查相关内容是否与任务一致，一致则继续推进todo.md，不一致就算没有；
-- 只要有任何一个没有，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地，并将具体情况规划方案等写入本地 readme.md。
+- 只要有任何一个没有，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地，并将具体情况规划方案等写入本地 readme.md （ readme.md 要让完全不了解项目的看了都能明白）。
 2. 单步原则：每个回复只能输出当前唯一步骤的配置，不可合并多个步骤。
 3. 用户问答原则：历史记录里的 user_prompt 反馈代表用户真实选择/回答，必须严格继承，不得重复询问已回答的问题，除非答案无法执行。
 4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
@@ -1056,14 +1090,21 @@ ${historyLogsText}
 =======================================================
 【当前调度决策】：
 请综合【全局目标任务】与【历史执行记录】，评估当前阶段并输出下一步操作：
+
+【最高优先级规则】：
+- 如果【全局目标任务】里包含“最新用户中途消息”，必须先判断它是不是用户在沟通、补充、纠正、暂停、提问、要求确认或表达不满。
+- 若是，则不得继续执行 fs_read/fs_write/fs_replace/shell_exec 等本地推进动作。
+- 此时必须输出 user_prompt，把你的理解、方案或需要确认的问题写进 question，等待用户确认。
+- 只有用户明确表示“继续、确认、可以、开始、按方案执行”时，才允许继续推进旧计划。
+
+【普通推进规则】：
 - 若不清楚任务情况，读取本地 readme.md 内容。
 - 若尚未初始化，输出生成详尽 todo.md 的单一配置。
 - 若历史里有用户问答结果，必须按用户选择继续推进，不要丢失用户决策。
 - 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
 - 每完成一项，在todo.md中打勾。
 - 若所有项已全部完成，输出 finish 配置。
-请输出当前步骤的配置：`;
-}
+请输出当前步骤的配置：
 
 // ==========================================
 // 6. 多模态容错提取与原生工具协议装配
