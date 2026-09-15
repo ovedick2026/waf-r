@@ -1104,7 +1104,7 @@ ${historyLogsText}
 - 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
 - 每完成一项，在todo.md中打勾。
 - 若所有项已全部完成，输出 finish 配置。
-请输出当前步骤的配置：
+请输出当前步骤的配置：`
 
 // ==========================================
 // 6. 多模态容错提取与原生工具协议装配
@@ -1167,7 +1167,7 @@ function assertNonEmptyUpstreamText(text, scene = '调度') {
   const clean = String(text || '').trim();
 
   if (!clean) {
-    throw new Error("上游 LLM 返回空内容，${scene}失败，不能伪造为任务已完成");
+    throw new Error(`上游 LLM 返回空内容，${scene}失败，不能伪造为任务已完成`);
   }
 
   return clean;
