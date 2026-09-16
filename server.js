@@ -857,7 +857,7 @@ function parseConversation(messages = []) {
       !clean.startsWith('<tool_result') &&
       !clean.includes("Today's date is") &&
       !/^\s*\{[\s\S]*\}\s*$/.test(clean) &&
-      !/^\s*(selected|answer|choice|option|确认|取消|yes|no)\s*[:：]/i.test(clean)
+      !/^\s*(selected|answer|choice|option|确认|取消|yes|no|继续|可以|开始|同意|好的|好|ok|OK|执行|按方案执行|就这样|没问题)\s*[:：]?/i.test(clean)
     ) {
       latestUserMessage = hardLimitText(clean, 6000, '最新用户中途消息');
       break;
@@ -1094,8 +1094,10 @@ ${historyLogsText}
 【最高优先级规则】：
 - 如果【全局目标任务】里包含“最新用户中途消息”，只需按其真实意图调整下一步动作，不要在【思考】里复述“用户中途消息是什么”。
 - 若是，则不得继续执行 fs_read/fs_write/fs_replace/shell_exec 等本地推进动作。
-- 此时必须输出 user_prompt，把你的理解、方案或需要确认的问题写进 question，等待用户确认。
-- 只有用户明确表示“继续、确认、可以、开始、按方案执行”时，才允许继续推进旧计划。
+- 此时只有在缺少关键信息、存在多个互斥方案、会造成不可逆/高风险修改时，才允许输出 user_prompt，把你的理解、方案或需要确认的问题写进 question，等待用户确认。最新用户消息只用于修正当前任务方向，不代表每一步都要询问确认。
+- 对普通读取、分析、生成草稿、更新 todo、按既定方案修改文件，不得反复询问。
+- 若历史里已有 user_prompt 的回答，必须继承该回答，不得换个说法重复提问。
+- 若用户已经明确表示“继续、确认、可以、开始、按方案执行、就这样、同意”，后续必须直接推进，不得重复询问同一事项。
 
 【普通推进规则】：
 - 若不清楚任务情况，读取本地 readme.md 内容。
