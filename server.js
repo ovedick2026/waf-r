@@ -1390,14 +1390,20 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 // ==========================================
 // Token 估算工具：用于提前触发 compact + 限制代理二次拼接 prompt
 // ==========================================
-const MAX_PROXY_PROMPT_CHARS = Number(process.env.MAX_PROXY_PROMPT_CHARS || 120000);
-const MAX_HISTORY_CHARS = Number(process.env.MAX_HISTORY_CHARS || 70000);
+// const MAX_PROXY_PROMPT_CHARS = Number(process.env.MAX_PROXY_PROMPT_CHARS || 120000);
+// const MAX_HISTORY_CHARS = Number(process.env.MAX_HISTORY_CHARS || 70000);
+// const MAX_GLOBAL_TASK_CHARS = Number(process.env.MAX_GLOBAL_TASK_CHARS || 20000);
+// 修改后
+const MAX_PROXY_PROMPT_CHARS = Number(process.env.MAX_PROXY_PROMPT_CHARS || 90000);
+const MAX_HISTORY_CHARS = Number(process.env.MAX_HISTORY_CHARS || 50000);
 const MAX_GLOBAL_TASK_CHARS = Number(process.env.MAX_GLOBAL_TASK_CHARS || 20000);
 
 function estimateTokensFromText(text = '') {
   const str = typeof text === 'string' ? text : JSON.stringify(text || {});
   // 温和估算
-  return Math.max(1, Math.ceil(str.length / 4));
+  // return Math.max(1, Math.ceil(str.length / 4));
+// 修改后
+  return Math.max(1, Math.ceil(str.length / 3.5));
 }
 
 function estimateTokensFromPayload(payload = {}) {
@@ -1448,15 +1454,28 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
 });
 
 // 关键修改：不要 Math.min(..., 10000)，否则 CC 以为上下文永远不大，不会自动 compact
+// app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
+//   const { messages } = req.body || {};
+//   const { globalTask, historyLogsText } = parseConversation(messages || []);
+//   const proxyPrompt = limitProxyPrompt(buildPrompt(globalTask, historyLogsText));
+
+//   // 返回代理真正可能发送给上游的 prompt 估算，而不是只估原始 req.body
+//   const inputTokens = estimateTokensFromText(proxyPrompt);
+
+//   res.json({ input_tokens: inputTokens });
+// });
+// 修改后
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
+  const rawTokens = estimateTokensFromPayload(req.body || {});
+
   const { messages } = req.body || {};
   const { globalTask, historyLogsText } = parseConversation(messages || []);
-  const proxyPrompt = limitProxyPrompt(buildPrompt(globalTask, historyLogsText));
+  const proxyPrompt = buildPrompt(globalTask, historyLogsText);
+  const proxyTokens = estimateTokensFromText(proxyPrompt);
 
-  // 返回代理真正可能发送给上游的 prompt 估算，而不是只估原始 req.body
-  const inputTokens = estimateTokensFromText(proxyPrompt);
-
-  res.json({ input_tokens: inputTokens });
+  res.json({
+    input_tokens: Math.max(rawTokens, proxyTokens)
+  });
 });
 
 function isCompactionRequest(messages) {
@@ -1524,6 +1543,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   });
 
   prompt = limitProxyPrompt(prompt);
+// 修改后
+  requestInputTokens = estimateTokensFromText(prompt);
 
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   let heartbeatTimer = null;
