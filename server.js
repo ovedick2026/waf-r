@@ -1579,9 +1579,32 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       }
     });
 
+    // heartbeatTimer = setInterval(() => {
+    //   if (!res.writableEnded) res.write(': keep-alive\n\n');
+    // }, 5000);
+
     heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) res.write(': keep-alive\n\n');
-    }, 5000);
+      if (!res.writableEnded) {
+        sendSSE('content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: { type: 'text', text: '' }
+        });
+    
+        sendSSE('content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: { type: 'text_delta', text: '\u200b' }
+        });
+    
+        sendSSE('content_block_stop', {
+          type: 'content_block_stop',
+          index: blockIndex
+        });
+    
+        blockIndex++;
+      }
+    }, 20000);
 
     // 关键：发真正 Anthropic SSE ping，不发注释
     // heartbeatTimer = setInterval(() => {
