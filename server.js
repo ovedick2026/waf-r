@@ -1513,7 +1513,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   };
 
   // req.on('close', abortUpstream);
-  // res.on('close', abortUpstream);
+  res.on('close', abortUpstream);
 
   const isCompacting = isCompactionRequest(messages);
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
@@ -1579,36 +1579,28 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       }
     });
 
-    // heartbeatTimer = setInterval(() => {
-    //   if (!res.writableEnded) res.write(': keep-alive\n\n');
-    // }, 5000);
-
-    let visibleHeartbeatStarted = false;
+    sendSSE('content_block_start', {
+      type: 'content_block_start',
+      index: blockIndex,
+      content_block: { type: 'text', text: '' }
+    });
+    
+    sendSSE('content_block_delta', {
+      type: 'content_block_delta',
+      index: blockIndex,
+      delta: { type: 'text_delta', text: '…' }
+    });
+    
+    sendSSE('content_block_stop', {
+      type: 'content_block_stop',
+      index: blockIndex
+    });
+    
+    blockIndex++;
 
     heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded && !visibleHeartbeatStarted) {
-        visibleHeartbeatStarted = true;
-    
-        sendSSE('content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: { type: 'text', text: '' }
-        });
-    
-        sendSSE('content_block_delta', {
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: { type: 'text_delta', text: '…' }
-        });
-    
-        sendSSE('content_block_stop', {
-          type: 'content_block_stop',
-          index: blockIndex
-        });
-    
-        blockIndex++;
-      }
-    }, 10000);
+      if (!res.writableEnded) res.write(': keep-alive\n\n');
+    }, 5000);
 
     // 关键：发真正 Anthropic SSE ping，不发注释
     // heartbeatTimer = setInterval(() => {
@@ -1815,7 +1807,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   };
 
   // req.on('close', abortUpstream);
-  // res.on('close', abortUpstream);
+  res.on('close', abortUpstream);
 
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
