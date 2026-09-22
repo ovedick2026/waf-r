@@ -13,7 +13,7 @@ setGlobalDispatcher(
   new Agent({
     headersTimeout: 2400000,
     bodyTimeout: 2400000,
-    connectTimeout: 120000
+    connectTimeout: 1200000
   })
 );
 
@@ -2079,4 +2079,4 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 server.requestTimeout = 2400000;
 server.headersTimeout = 2400000;
-server.keepAliveTimeout = 120000;
+server.keepAliveTimeout = 1200000;
