@@ -1124,7 +1124,15 @@ function safeParseJson(str) {
       });
       return JSON.parse(fixed);
     } catch (e2) {
-      return null;
+      // 容错：处理 command 字符串中嵌套有裸双引号的情况，如 -name "TODO.md"
+      try {
+        const aggressive = clean.replace(/:\s*"([\s\S]*?)"\s*([,}])/g, (m, val, end) => {
+          return `: "${val.replace(/(?<!\\)"/g, '\\"')}"${end}`;
+        });
+        return JSON.parse(aggressive);
+      } catch (e3) {
+        return null;
+      }
     }
   }
 }
@@ -1176,13 +1184,13 @@ function assertNonEmptyUpstreamText(text, scene = '调度') {
   return clean;
 }
 
-function extractActionAndThought(rawText) {
+function extractActionAndThought(rawText, fallbackThinking = '') {
   if (!rawText || typeof rawText !== 'string') return null;
   let thought = '';
   let action = '';
   let params = {};
 
-  const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```json|```|<tool_call>|$)/i);
+  const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```json|```|<tool_call>|\{|$)/i);
   if (thoughtMatch) {
     thought = thoughtMatch[1].trim();
   }
@@ -1192,19 +1200,36 @@ function extractActionAndThought(rawText) {
     action = actionMatch[1].trim();
   }
 
-  const mdMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   let parsedJson = null;
+  const mdMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   if (mdMatch) {
     parsedJson = safeParseJson(mdMatch[1]);
+  }
+  if (!parsedJson) {
+    const tcMatch = rawText.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
+    if (tcMatch) parsedJson = safeParseJson(tcMatch[1]);
   }
   if (!parsedJson) {
     parsedJson = scanBalancedJsonObject(rawText);
   }
 
   if (parsedJson && typeof parsedJson === 'object') {
-    if (parsedJson.action) {
+    // 关键兼容：支持 {"name":"Bash","arguments":{...}} 或 {"tool":"...","parameters":{...}}
+    const possibleName = parsedJson.name || parsedJson.tool || parsedJson.tool_name || parsedJson.function?.name;
+    const possibleArgs = parsedJson.arguments || parsedJson.parameters || parsedJson.input || parsedJson.args || parsedJson.function?.arguments;
+
+    if (possibleName) {
+      action = possibleName;
+      if (typeof possibleArgs === 'string') {
+        params = safeParseJson(possibleArgs) || { raw: possibleArgs };
+      } else if (possibleArgs && typeof possibleArgs === 'object') {
+        params = possibleArgs;
+      } else {
+        const { name: _n, tool: _t, ...rest } = parsedJson;
+        params = rest;
+      }
+    } else if (parsedJson.action) {
       action = parsedJson.action;
-      thought = parsedJson.step_thought || parsedJson.thought || thought;
       params = parsedJson.params || parsedJson.arguments || parsedJson;
       if (params.action) {
         const { action: _a, step_thought: _st, thought: _t, ...rest } = params;
@@ -1215,7 +1240,7 @@ function extractActionAndThought(rawText) {
     } else if (parsedJson.file_path && parsedJson.content !== undefined) {
       action = 'fs_write';
       params = parsedJson;
-    } else if (parsedJson.command) {
+    } else if (parsedJson.command || parsedJson.cmd) {
       action = 'shell_exec';
       params = parsedJson;
     } else if (parsedJson.file_path && parsedJson.old_string !== undefined) {
@@ -1225,9 +1250,51 @@ function extractActionAndThought(rawText) {
       action = 'fs_read';
       params = parsedJson;
     }
+
+    thought = parsedJson.step_thought || parsedJson.thought || parsedJson.description || thought;
   }
 
-  if (!thought && !action && !Object.keys(params).length) {
+  // 思考兜底 1：提取模型返回的自然语言前缀
+  if (!thought) {
+    const strippedText = rawText
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+      .replace(/\{[\s\S]*\}/g, '')
+      .replace(/【调度动作】[：:].*/g, '')
+      .trim();
+    if (strippedText && strippedText.length >= 2) {
+      thought = strippedText.split('\n')[0].replace(/^[-*#\s]+/, '').trim();
+    }
+  }
+
+  // 思考兜底 2：使用上游推理流（Reasoning Content）首句
+  if (!thought && fallbackThinking) {
+    const firstLine = fallbackThinking.trim().split('\n').find(l => l.trim().length > 3) || '';
+    thought = firstLine.replace(/^[#\-*\s]+/, '').slice(0, 120).trim();
+  }
+
+  // 思考兜底 3：根据动作与参数自愈思考内容
+  if (!thought) {
+    const normAct = String(action || '').toLowerCase();
+    const cmd = params.command || params.cmd;
+    const fp = params.file_path || params.path;
+
+    if (normAct === 'bash' || normAct === 'shell_exec') {
+      thought = cmd ? `执行终端指令: ${cmd.slice(0, 100)}` : '执行 Shell 脚本';
+    } else if (normAct === 'fs_read' || normAct === 'read') {
+      thought = fp ? `读取文件: ${fp}` : '读取目标文件内容';
+    } else if (normAct === 'fs_write' || normAct === 'write') {
+      thought = fp ? `写入/生成文件: ${fp}` : '写入目标文件';
+    } else if (normAct === 'fs_replace' || normAct === 'edit') {
+      thought = fp ? `修改替换文件内容: ${fp}` : '更新文件内容';
+    } else if (normAct === 'finish') {
+      thought = '流水线执行完成，提交总结';
+    } else {
+      thought = `执行操作: ${action || '处理当前任务'}`;
+    }
+  }
+
+  if (!action && !Object.keys(params).length) {
     return null;
   }
 
@@ -1611,7 +1678,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   }
 
   try {
-    const { text: assistantText } = await fetchUpstreamStream(
+    const { text: assistantText, thinking: assistantThinking } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
@@ -1642,7 +1709,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     
       stopReason = 'end_turn';
     } else {
-      const parsedAction = extractActionAndThought(safeAssistantText);
+      const parsedAction = extractActionAndThought(safeAssistantText, assistantThinking);
     
       if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
         const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
@@ -1854,7 +1921,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       实际上游Prompt估算Token: requestInputTokens
     });
 
-    const { text: assistantText } = await fetchUpstreamStream(
+    const { text: assistantText, thinking: assistantThinking } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
@@ -1866,7 +1933,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     
     const safeAssistantText = assertNonEmptyUpstreamText(assistantText, '任务调度');
-    const parsedAction = extractActionAndThought(safeAssistantText);
+    const parsedAction = extractActionAndThought(safeAssistantText, assistantThinking);
     
     const callId = 'call_' + crypto.randomBytes(8).toString('hex');
     let toolCalls = null;
