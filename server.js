@@ -13,7 +13,7 @@ setGlobalDispatcher(
   new Agent({
     headersTimeout: 2400000,
     bodyTimeout: 2400000,
-    connectTimeout: 1200000
+    connectTimeout: 120000
   })
 );
 
@@ -23,6 +23,26 @@ app.use(express.json({ limit: '100mb' }));
 
 const PORT = Number(process.env.PORT || 7860);
 const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
+
+// ==========================================
+// 0. 下游（Claude Code）保活配置
+// ==========================================
+// Claude Code 有一个流式看门狗：连续 300 秒收不到"真正的 SSE 事件"就主动中断连接
+// （CLAUDE_STREAM_IDLE_TIMEOUT_MS，下限 300 秒，默认开启）。
+//   - ": keep-alive" 注释行不算事件；它只会让 CC 内部每 10 秒合成一个"字节仍在流动"的信号，
+//     这种合成信号最多连续续命 30 次（=300 秒），之后再无事件就在 300 秒后中断。300+300=600 秒，
+//     正是 log.txt 里两次 605 秒断开的来源。
+//   - "event: ping" 会被 CC 的 SDK 直接丢弃，同样不算事件。
+//   - 只有 content_block_delta / message_delta 这类事件才会重置看门狗。
+// 所以在等待上游思考期间，每 SSE_EVENT_HEARTBEAT_MS 毫秒往已打开的 text 块里发一个空的 text_delta。
+// 空 delta 不会改变最终文本，CC 侧完全无感，但会让看门狗持续重置。设为 0 可关闭（不建议）。
+const SSE_EVENT_HEARTBEAT_MS = Number(process.env.SSE_EVENT_HEARTBEAT_MS || 15000);
+// 注释行心跳（给中间的 nginx / 负载均衡等按字节判活的组件用），设为 0 可关闭
+const SSE_COMMENT_HEARTBEAT_MS = Number(process.env.SSE_COMMENT_HEARTBEAT_MS || 5000);
+// 等待上游期间的进度日志间隔（仅 DEBUG=true 时输出），设为 0 可关闭
+const UPSTREAM_PROGRESS_LOG_MS = Number(process.env.UPSTREAM_PROGRESS_LOG_MS || 60000);
+// 上游 /v1/messages 探测失败（404/405）后，多长时间内不再重复探测、直接走 /v1/chat/completions
+const MESSAGES_PROBE_CACHE_MS = Number(process.env.MESSAGES_PROBE_CACHE_MS || 60 * 60 * 1000);
 
 // ==========================================
 // 1. 结构化增量日志
@@ -1337,6 +1357,10 @@ async function* readSSE(response) {
   }
 }
 
+// 记录哪些上游不支持 /v1/messages（探测得到 404/405），一段时间内直接走 /v1/chat/completions，
+// 省掉每个请求一次无用的往返（也就是 server.js 日志里那些 "[404] Unsupported Route: POST /v1/messages"）。
+const messagesEndpointUnsupportedUntil = new Map();
+
 async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinkingChunk, signal) {
   const headers = {
     'Content-Type': 'application/json',
@@ -1347,39 +1371,57 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
     'Accept': 'text/event-stream, application/json'
   };
 
-  try {
-    const res = await fetch(`${targetBase}/v1/messages`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: model || 'claude-3-7-sonnet-20250219',
-        max_tokens: 8192,
-        messages: [{ role: 'user', content: prompt }],
-        stream: true
-      }),
-      signal
-    });
+  const skipMessagesProbe = (messagesEndpointUnsupportedUntil.get(targetBase) || 0) > Date.now();
 
-    if (res.ok) {
-      let fullText = '';
-      let thinkingText = '';
-      for await (const chunk of readSSE(res)) {
-        if (!chunk || chunk === '[DONE]') continue;
-        try {
-          const payload = JSON.parse(chunk);
-          if (payload.type === 'content_block_delta') {
-            if (payload.delta?.type === 'thinking_delta' && payload.delta.thinking) {
-              thinkingText += payload.delta.thinking;
-              if (onThinkingChunk) onThinkingChunk(payload.delta.thinking);
-            } else if (payload.delta?.type === 'text_delta' && payload.delta.text) {
-              fullText += payload.delta.text;
+  if (!skipMessagesProbe) {
+    try {
+      const res = await fetch(`${targetBase}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: model || 'claude-3-7-sonnet-20250219',
+          max_tokens: 8192,
+          messages: [{ role: 'user', content: prompt }],
+          stream: true
+        }),
+        signal
+      });
+
+      if (res.ok) {
+        let fullText = '';
+        let thinkingText = '';
+        for await (const chunk of readSSE(res)) {
+          if (!chunk || chunk === '[DONE]') continue;
+          try {
+            const payload = JSON.parse(chunk);
+            if (payload.type === 'content_block_delta') {
+              if (payload.delta?.type === 'thinking_delta' && payload.delta.thinking) {
+                thinkingText += payload.delta.thinking;
+                if (onThinkingChunk) onThinkingChunk(payload.delta.thinking);
+              } else if (payload.delta?.type === 'text_delta' && payload.delta.text) {
+                fullText += payload.delta.text;
+              }
             }
-          }
-        } catch {}
+          } catch {}
+        }
+        return { text: fullText, thinking: thinkingText };
       }
-      return { text: fullText, thinking: thinkingText };
+
+      // 非 2xx：释放响应体；404/405 说明该上游根本没有这个端点，记下来避免重复探测
+      try { await res.body?.cancel(); } catch {}
+      if (res.status === 404 || res.status === 405) {
+        messagesEndpointUnsupportedUntil.set(targetBase, Date.now() + MESSAGES_PROBE_CACHE_MS);
+        logger.debug('上游不支持 /v1/messages，后续直接走 /v1/chat/completions', {
+          目标上游: targetBase,
+          状态码: res.status,
+          缓存时长秒: Math.round(MESSAGES_PROBE_CACHE_MS / 1000)
+        });
+      }
+    } catch (e) {
+      // 下游已断开：不要再去打 chat/completions
+      if (signal?.aborted) throw e;
     }
-  } catch (e) {}
+  }
 
   const chatRes = await fetch(`${targetBase}/v1/chat/completions`, {
     method: 'POST',
@@ -1590,6 +1632,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   logger.debug('收到 Claude Code 调度请求', {
     '目标上游': upstreamBase,
     '模型': model,
+    '流式': stream ? '是' : '否（非流式：CC 会一直等到上游完成，受 CC 侧 API_TIMEOUT_MS 限制）',
     '压缩模式': isCompacting ? '是 (Compaction)' : '否',
     '原始请求估算Token': rawRequestTokens,
     '本次增量输入': latestTurnInput || '（初始启动任务）'
@@ -1602,7 +1645,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     prompt = buildPrompt(globalTask, historyLogsText);
   }
 
-  const requestInputTokens = estimateTokensFromText(prompt);
+  // 【修复】原来这里是 const，下面截断后又重新赋值，每个请求都会抛 TypeError（在任何东西发给上游之前就 500）
+  let requestInputTokens = estimateTokensFromText(prompt);
 
   logger.debug('中介实际上游Prompt', {
     'Prompt字符数': prompt.length,
@@ -1610,17 +1654,27 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   });
 
   prompt = limitProxyPrompt(prompt);
-// 修改后
   requestInputTokens = estimateTokensFromText(prompt);
 
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
-  let heartbeatTimer = null;
+  let commentHeartbeatTimer = null;
+  let eventHeartbeatTimer = null;
+  let progressTimer = null;
   let blockIndex = 0;
+  let textBlockOpen = false;
+  let upstreamThinkingChars = 0;
+  const waitStartedAt = Date.now();
 
   const sendSSE = (ev, data) => {
     if (!res.writableEnded) {
       res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
     }
+  };
+
+  const clearTimers = () => {
+    if (commentHeartbeatTimer) { clearInterval(commentHeartbeatTimer); commentHeartbeatTimer = null; }
+    if (eventHeartbeatTimer) { clearInterval(eventHeartbeatTimer); eventHeartbeatTimer = null; }
+    if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
   };
 
   if (stream) {
@@ -1646,35 +1700,42 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       }
     });
 
+    // 立即打开 text 块 0 并保持打开：等待上游期间往里面发空 text_delta 作为心跳（见文件头部说明），
+    // 最终的 thought / 总结文本也写进这个块，然后再关闭。原来那个立刻发出又立刻关闭的 "…" 占位块去掉了：
+    // 它既没法承载心跳，又会作为一段独立的 "…" 文本进入 CC 的对话历史。
     sendSSE('content_block_start', {
       type: 'content_block_start',
       index: blockIndex,
       content_block: { type: 'text', text: '' }
     });
-    
-    sendSSE('content_block_delta', {
-      type: 'content_block_delta',
-      index: blockIndex,
-      delta: { type: 'text_delta', text: '…' }
-    });
-    
-    sendSSE('content_block_stop', {
-      type: 'content_block_stop',
-      index: blockIndex
-    });
-    
-    blockIndex++;
+    textBlockOpen = true;
 
-    heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) res.write(': keep-alive\n\n');
-    }, 5000);
+    if (SSE_COMMENT_HEARTBEAT_MS > 0) {
+      commentHeartbeatTimer = setInterval(() => {
+        if (!res.writableEnded) res.write(': keep-alive\n\n');
+      }, SSE_COMMENT_HEARTBEAT_MS);
+    }
 
-    // 关键：发真正 Anthropic SSE ping，不发注释
-    // heartbeatTimer = setInterval(() => {
-    //   if (!res.writableEnded) {
-    //     sendSSE('ping', { type: 'ping' });
-    //   }
-    // }, 15000);
+    if (SSE_EVENT_HEARTBEAT_MS > 0) {
+      eventHeartbeatTimer = setInterval(() => {
+        if (res.writableEnded || !textBlockOpen) return;
+        sendSSE('content_block_delta', {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: '' }
+        });
+      }, SSE_EVENT_HEARTBEAT_MS);
+    }
+  }
+
+  if (IS_DEBUG && UPSTREAM_PROGRESS_LOG_MS > 0) {
+    progressTimer = setInterval(() => {
+      logger.debug('等待上游中', {
+        已等待秒: Math.round((Date.now() - waitStartedAt) / 1000),
+        已收到上游思考字符: upstreamThinkingChars,
+        下游流式: stream ? '是' : '否'
+      });
+    }, UPSTREAM_PROGRESS_LOG_MS);
   }
 
   try {
@@ -1683,11 +1744,11 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       apiKey,
       model,
       prompt,
-      null,
+      (chunk) => { upstreamThinkingChars += chunk.length; },
       upstreamAbort.signal
     );
-    
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+    clearTimers();
     
     const safeAssistantText = assertNonEmptyUpstreamText(
       assistantText,
@@ -1747,22 +1808,21 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       8;
 
     if (stream) {
-      if (textContent) {
-        sendSSE('content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: { type: 'text', text: '' }
-        });
-        sendSSE('content_block_delta', {
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: { type: 'text_delta', text: textContent }
-        });
+      // 把最终文本写进一直保持打开的块 0，然后关闭它
+      if (textBlockOpen) {
+        if (textContent) {
+          sendSSE('content_block_delta', {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: textContent }
+          });
+        }
         sendSSE('content_block_stop', {
           type: 'content_block_stop',
-          index: blockIndex
+          index: 0
         });
-        blockIndex++;
+        textBlockOpen = false;
+        blockIndex = 1;
       }
 
       if (toolBlock) {
@@ -1825,11 +1885,13 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       });
     }
   } catch (err) {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    clearTimers();
 
     if (upstreamAbort.signal.aborted) {
       logger.debug('v1/message上游请求已因下游断开而中止', {
-        目标上游: upstreamBase
+        目标上游: upstreamBase,
+        已等待秒: Math.round((Date.now() - waitStartedAt) / 1000),
+        已收到上游思考字符: upstreamThinkingChars
       });
       return;
     }
@@ -1839,11 +1901,24 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     finished = true;
     if (!res.headersSent) {
       res.status(500).json({ error: { message: err.message } });
+    } else if (stream) {
+      // 流已经打开：按 Anthropic SSE 规范发一个 error 事件再关闭，CC 会把它当作一次可重试的 API 错误。
+      // 原来是直接 res.end()，CC 会判定为"连接中断、响应被截断"，然后追加一句
+      // "Your response above was cut off mid-stream. Resume..." 重新发请求，这句话会被当成用户中途消息进入下一轮 prompt。
+      sendSSE('error', {
+        type: 'error',
+        error: { type: 'api_error', message: err.message }
+      });
+      res.end();
     } else {
       res.end();
     }
   } finally {
-    logger.debug('v1/message 下游断开!!!');
+    clearTimers();
+    logger.debug('v1/messages 请求处理结束', {
+      耗时秒: Math.round((Date.now() - startTime) / 1000),
+      下游是否中途断开: upstreamAbort.signal.aborted ? '是' : '否'
+    });
     // req.off?.('close', abortUpstream);
     res.off?.('close', abortUpstream);
   }
@@ -2079,4 +2154,4 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 server.requestTimeout = 2400000;
 server.headersTimeout = 2400000;
-server.keepAliveTimeout = 1200000;
+server.keepAliveTimeout = 120000;
