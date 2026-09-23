@@ -36,9 +36,20 @@ const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 //   - 只有 content_block_delta / message_delta 这类事件才会重置看门狗。
 // 所以在等待上游思考期间，每 SSE_EVENT_HEARTBEAT_MS 毫秒往已打开的 text 块里发一个空的 text_delta。
 // 空 delta 不会改变最终文本，CC 侧完全无感，但会让看门狗持续重置。设为 0 可关闭（不建议）。
+//
+// CC 经 CLIProxyAPI 走 /v1/chat/completions 时（CC -> CLIProxyAPI -> 本服务）：CLIProxyAPI 会把
+// delta:{}、content:"" 这类空块直接丢掉，一个 Claude 事件都不产生，CC 只能收到 message_start，
+// 之后照样被看门狗掐断（605 秒那次）。能穿过它、又不改最终文本的只有非空的 reasoning_content，
+// 它会被转成 thinking_delta。所以 OpenAI 通道同样按这个间隔发一个内容为空格的 reasoning_content；
+// 纯空白的 thinking 在 CC 回传历史时会被 CLIProxyAPI 丢弃，不会进入下一轮 prompt。
 const SSE_EVENT_HEARTBEAT_MS = Number(process.env.SSE_EVENT_HEARTBEAT_MS || 15000);
 // 注释行心跳（给中间的 nginx / 负载均衡等按字节判活的组件用），设为 0 可关闭
 const SSE_COMMENT_HEARTBEAT_MS = Number(process.env.SSE_COMMENT_HEARTBEAT_MS || 5000);
+// 非流式请求保活：CC 流式失败后会用同一请求体改走非流式重试，这个重试的超时是 API_TIMEOUT_MS，
+// 未设置时在 CLAUDE_CODE_REMOTE 环境下只有 120 秒（125 秒那次）；Cloudflare 也有 100 秒首字节超时。
+// 超过这个时间还没结果，就先发出 200 + JSON 响应头，之后定期写一个换行（JSON 前导空白合法），
+// 最后再写完整 JSON。这个时间以内就失败的请求仍然返回正常的错误状态码。设为 0 可关闭。
+const NONSTREAM_KEEPALIVE_MS = Number(process.env.NONSTREAM_KEEPALIVE_MS || 15000);
 // 等待上游期间的进度日志间隔（仅 DEBUG=true 时输出），设为 0 可关闭
 const UPSTREAM_PROGRESS_LOG_MS = Number(process.env.UPSTREAM_PROGRESS_LOG_MS || 60000);
 // 上游 /v1/messages 探测失败（404/405）后，多长时间内不再重复探测、直接走 /v1/chat/completions
@@ -1060,8 +1071,7 @@ ${latestUserMessage}
 // 5. 强化版抗风控 Prompt
 // ==========================================
 function buildPrompt(globalTask, historyLogsText) {
-  return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出或用户回答作为日志反馈给你。
-
+  return `
 【流水线可用指令库（Action Library）】：
 1. 文件与代码管理：
    - fs_write: {"file_path": "路径", "content": "完整文本"}
@@ -1082,15 +1092,6 @@ function buildPrompt(globalTask, historyLogsText) {
 5. 流程终结：
    - finish: {"summary": "全部流水线验收完成后的总结报告"}
 
-【流水线设计约束】：
-1. 拆解规范：当工作流初次启动（无历史记录）时，先检查本地目录是否有 todo.md 和 readme.md 文件：
-- 若都有，检查相关内容是否与任务一致，一致则继续推进todo.md，不一致就算没有；
-- 只要有任何一个没有，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地，并将具体情况规划方案等写入本地 readme.md （ readme.md 要让完全不了解项目的看了都能明白）。
-2. 单步原则：每个回复只能输出当前唯一步骤的配置，不可合并多个步骤。
-3. 用户问答原则：历史记录里的 user_prompt 反馈代表用户真实选择/回答，必须严格继承，不得重复询问已回答的问题，除非答案无法执行。
-4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
-5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n，不要打回车换行）。
-
 【强制返回格式模板示例】:
 【思考】: 用一句自然语言说明当前要执行的动作，不要复述规则、不要分析“用户中途消息”。
 【调度动作】: fs_write
@@ -1108,24 +1109,7 @@ ${globalTask}
 【历史执行记录】：
 ${historyLogsText}
 =======================================================
-【当前调度决策】：
-请综合【全局目标任务】与【历史执行记录】，评估当前阶段并输出下一步操作：
 
-【最高优先级规则】：
-- 如果【全局目标任务】里包含“最新用户中途消息”，只需按其真实意图调整下一步动作，不要在【思考】里复述“用户中途消息是什么”。
-- 若是，则不得继续执行 fs_read/fs_write/fs_replace/shell_exec 等本地推进动作。
-- 此时只有在缺少关键信息、存在多个互斥方案、会造成不可逆/高风险修改时，才允许输出 user_prompt，把你的理解、方案或需要确认的问题写进 question，等待用户确认。最新用户消息只用于修正当前任务方向，不代表每一步都要询问确认。
-- 对普通读取、分析、生成草稿、更新 todo、按既定方案修改文件，不得反复询问。
-- 若历史里已有 user_prompt 的回答，必须继承该回答，不得换个说法重复提问。
-- 若用户已经明确表示“继续、确认、可以、开始、按方案执行、就这样、同意”，后续必须直接推进，不得重复询问同一事项。
-
-【普通推进规则】：
-- 若不清楚任务情况，读取本地 readme.md 内容。
-- 若尚未初始化，输出生成详尽 todo.md 的单一配置。
-- 若历史里有用户问答结果，必须按用户选择继续推进，不要丢失用户决策。
-- 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
-- 每完成一项，在todo.md中打勾。
-- 若所有项已全部完成，输出 finish 配置。
 请输出当前步骤的配置：`;
 }
 
@@ -1587,6 +1571,29 @@ app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
   });
 });
 
+// 非流式请求的保活（见文件头部 NONSTREAM_KEEPALIVE_MS 说明），返回停止函数
+function startNonStreamKeepAlive(res) {
+  if (NONSTREAM_KEEPALIVE_MS <= 0) return () => {};
+  const timer = setInterval(() => {
+    if (res.writableEnded) return;
+    if (!res.headersSent) {
+      res.status(200);
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    }
+    res.write('\n');
+  }, NONSTREAM_KEEPALIVE_MS);
+  return () => clearInterval(timer);
+}
+
+// 保活已经发出响应头后只能沿用 200，直接把 JSON 接在换行后面
+function sendJson(res, status, body) {
+  if (res.headersSent) {
+    res.end(JSON.stringify(body));
+  } else {
+    res.status(status).json(body);
+  }
+}
+
 function isCompactionRequest(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return false;
   const lastMsg = messages[messages.length - 1];
@@ -1660,6 +1667,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   let commentHeartbeatTimer = null;
   let eventHeartbeatTimer = null;
   let progressTimer = null;
+  let stopNonStreamKeepAlive = () => {};
   let blockIndex = 0;
   let textBlockOpen = false;
   let upstreamThinkingChars = 0;
@@ -1675,6 +1683,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (commentHeartbeatTimer) { clearInterval(commentHeartbeatTimer); commentHeartbeatTimer = null; }
     if (eventHeartbeatTimer) { clearInterval(eventHeartbeatTimer); eventHeartbeatTimer = null; }
     if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+    stopNonStreamKeepAlive();
   };
 
   if (stream) {
@@ -1726,6 +1735,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         });
       }, SSE_EVENT_HEARTBEAT_MS);
     }
+  } else {
+    stopNonStreamKeepAlive = startNonStreamKeepAlive(res);
   }
 
   if (IS_DEBUG && UPSTREAM_PROGRESS_LOG_MS > 0) {
@@ -1867,7 +1878,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       res.end();
     } else {
       finished = true;
-      res.json({
+      sendJson(res, 200, {
         id: msgId,
         type: 'message',
         role: 'assistant',
@@ -1899,9 +1910,11 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     logger.error('Claude Code 消息通道异常', err.message);
 
     finished = true;
-    if (!res.headersSent) {
+    if (!stream) {
+      sendJson(res, 500, { type: 'error', error: { type: 'api_error', message: err.message } });
+    } else if (!res.headersSent) {
       res.status(500).json({ error: { message: err.message } });
-    } else if (stream) {
+    } else {
       // 流已经打开：按 Anthropic SSE 规范发一个 error 事件再关闭，CC 会把它当作一次可重试的 API 错误。
       // 原来是直接 res.end()，CC 会判定为"连接中断、响应被截断"，然后追加一句
       // "Your response above was cut off mid-stream. Resume..." 重新发请求，这句话会被当成用户中途消息进入下一轮 prompt。
@@ -1909,8 +1922,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         type: 'error',
         error: { type: 'api_error', message: err.message }
       });
-      res.end();
-    } else {
       res.end();
     }
   } finally {
@@ -1962,6 +1973,14 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   });
 
   let heartbeatTimer = null;
+  let reasoningHeartbeatTimer = null;
+  let stopNonStreamKeepAlive = () => {};
+
+  const clearTimers = () => {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    if (reasoningHeartbeatTimer) { clearInterval(reasoningHeartbeatTimer); reasoningHeartbeatTimer = null; }
+    stopNonStreamKeepAlive();
+  };
 
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -1969,21 +1988,37 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    // 关键：OpenAI 兼容流发空 delta，不发 SSE 注释
-    heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({
-          id: 'chatcmpl-keepalive',
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{
-            index: 0,
-            delta: {}
-          }]
-        })}\n\n`);
-      }
-    }, 5000);
+    const writeKeepaliveChunk = (delta) => {
+      if (res.writableEnded) return;
+      res.write(`data: ${JSON.stringify({
+        id: 'chatcmpl-keepalive',
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          index: 0,
+          delta
+        }]
+      })}\n\n`);
+    };
+
+    // 首包立即发出：CLIProxyAPI 收到第一个 chunk 才会给 CC 发 message_start
+    writeKeepaliveChunk({ role: 'assistant' });
+
+    // 字节级保活：OpenAI 兼容流发空 delta，不发 SSE 注释
+    if (SSE_COMMENT_HEARTBEAT_MS > 0) {
+      heartbeatTimer = setInterval(() => writeKeepaliveChunk({}), SSE_COMMENT_HEARTBEAT_MS);
+    }
+
+    // 事件级保活：空 delta 会被 CLIProxyAPI 丢掉，CC 看门狗收不到任何事件（见文件头部说明）
+    if (SSE_EVENT_HEARTBEAT_MS > 0) {
+      reasoningHeartbeatTimer = setInterval(
+        () => writeKeepaliveChunk({ reasoning_content: ' ' }),
+        SSE_EVENT_HEARTBEAT_MS
+      );
+    }
+  } else {
+    stopNonStreamKeepAlive = startNonStreamKeepAlive(res);
   }
 
   try {
@@ -2004,9 +2039,9 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       null,
       upstreamAbort.signal
     );
-    
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    
+
+    clearTimers();
+
     const safeAssistantText = assertNonEmptyUpstreamText(assistantText, '任务调度');
     const parsedAction = extractActionAndThought(safeAssistantText, assistantThinking);
     
@@ -2100,7 +2135,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       res.end();
     } else {
       finished = true;
-      res.json({
+      sendJson(res, 200, {
         id: 'chatcmpl-' + crypto.randomBytes(8).toString('hex'),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
@@ -2122,7 +2157,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       });
     }
   } catch (err) {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    clearTimers();
 
     if (upstreamAbort.signal.aborted) {
       logger.debug('上游请求已因下游断开而中止', {
@@ -2134,12 +2169,15 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     logger.error('ChatCompletions 消息通道异常', err.message);
 
     finished = true;
-    if (!res.headersSent) {
+    if (!stream) {
+      sendJson(res, 500, { error: { message: err.message, type: 'api_error' } });
+    } else if (!res.headersSent) {
       res.status(500).json({ error: { message: err.message } });
     } else {
       res.end();
     }
   } finally {
+    clearTimers();
     logger.debug('/v1/chat/completions下游断开!!!');
     // req.off?.('close', abortUpstream);
     res.off?.('close', abortUpstream);
