@@ -175,12 +175,25 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
 
-  if (normAction === 'net_search' || normAction === 'websearch') {
-    return { name: 'WebSearch', arguments: { query: params.query || '' } };
-  }
+  // if (normAction === 'net_search' || normAction === 'websearch') {
+  //   return { name: 'WebSearch', arguments: { query: params.query || '' } };
+  // }
 
-  if (normAction === 'net_fetch' || normAction === 'webfetch') {
-    return { name: 'WebFetch', arguments: { url: params.url || '', prompt: params.prompt || '提取关键内容' } };
+  // if (normAction === 'net_fetch' || normAction === 'webfetch') {
+  //   return { name: 'WebFetch', arguments: { url: params.url || '', prompt: params.prompt || '提取关键内容' } };
+  // }
+
+  if (normAction === 'net_search' || normAction === 'websearch') {
+    // 从 CC 传上来的工具列表里，动态找名字包含 tavily 的工具
+    const tavilyTool = req.body.tools?.find(t => t.name?.toLowerCase().includes('tavily'));
+  
+    return {
+      // 找到了就用 CC 注册的真实名字，找不到就兜底写 'tavily'
+      name: tavilyTool ? tavilyTool.name : 'tavily',
+      arguments: { 
+        query: params.query || '' 
+      }
+    };
   }
 
   if (normAction === 'subflow_spawn' || normAction === 'agent') {
