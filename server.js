@@ -175,6 +175,58 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
 
+    // ==========================================
+  // 网络搜索：net_search (Tavily优先) 与 net_search2 (Serper优先)
+  // ==========================================
+  if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
+    const query = params.query || '';
+    
+    // 动态嗅探 CC 是否挂载了 Tavily 或 Serper MCP
+    const tavilyTool = tools?.find(t => t.name?.toLowerCase().includes('tavily'));
+    const serperTool = tools?.find(t => {
+      const n = t.name?.toLowerCase() || '';
+      return n.includes('serper') || n.includes('google_search');
+    });
+
+    // 如果调的是 net_search2，优先走 Serper，找不到再兜底 Tavily
+    if (normAction === 'net_search2') {
+      const targetToolName = serperTool ? serperTool.name : (tavilyTool ? tavilyTool.name : 'serper');
+      return {
+        name: targetToolName,
+        arguments: { query }
+      };
+    }
+
+    // 默认 net_search：优先走 Tavily，找不到再兜底走 Serper
+    const targetToolName = tavilyTool ? tavilyTool.name : (serperTool ? serperTool.name : 'tavily');
+    return {
+      name: targetToolName,
+      arguments: { query }
+    };
+  }
+
+  // ==========================================
+  // 网页抓取：net_fetch (原生直连) 与 net_fetch2 (Jina 破盾防反爬)
+  // ==========================================
+  if (normAction === 'net_fetch' || normAction === 'net_fetch2' || normAction === 'webfetch') {
+    let targetUrl = params.url || '';
+
+    // 如果指定了 net_fetch2，自动添加 Jina Reader 破盾前缀
+    if (normAction === 'net_fetch2') {
+      if (targetUrl && !targetUrl.startsWith('https://r.jina.ai/')) {
+        targetUrl = `https://r.jina.ai/${targetUrl}`;
+      }
+    }
+
+    return {
+      name: 'WebFetch', // 依然交给 CC 本地原生的 WebFetch 抓取，免配置！
+      arguments: {
+        url: targetUrl,
+        prompt: params.prompt || '提取关键正文内容'
+      }
+    };
+  }
+
   // if (normAction === 'net_search' || normAction === 'websearch') {
   //   return { name: 'WebSearch', arguments: { query: params.query || '' } };
   // }
@@ -183,18 +235,18 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
   //   return { name: 'WebFetch', arguments: { url: params.url || '', prompt: params.prompt || '提取关键内容' } };
   // }
 
-  if (normAction === 'net_search' || normAction === 'websearch') {
-    // 从 CC 传上来的工具列表里，动态找名字包含 tavily 的工具
-    const tavilyTool = req.body.tools?.find(t => t.name?.toLowerCase().includes('tavily'));
+  // if (normAction === 'net_search' || normAction === 'websearch') {
+  //   // 从 CC 传上来的工具列表里，动态找名字包含 tavily 的工具
+  //   const tavilyTool = req.body.tools?.find(t => t.name?.toLowerCase().includes('tavily'));
   
-    return {
-      // 找到了就用 CC 注册的真实名字，找不到就兜底写 'tavily'
-      name: tavilyTool ? tavilyTool.name : 'tavily',
-      arguments: { 
-        query: params.query || '' 
-      }
-    };
-  }
+  //   return {
+  //     // 找到了就用 CC 注册的真实名字，找不到就兜底写 'tavily'
+  //     name: tavilyTool ? tavilyTool.name : 'tavily',
+  //     arguments: { 
+  //       query: params.query || '' 
+  //     }
+  //   };
+  // }
 
   if (normAction === 'subflow_spawn' || normAction === 'agent') {
     return {
@@ -950,7 +1002,19 @@ ${latestUserMessage}
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_use') {
-            const mappedAction = CC_TO_ACTION_MAP[p.name] || 'shell_exec';
+            const toolNameLower = (p.name || '').toLowerCase();
+            let mappedAction = CC_TO_ACTION_MAP[p.name];
+
+            // 动态识别搜索回传
+            if (!mappedAction) {
+              if (toolNameLower.includes('serper')) {
+                mappedAction = 'net_search2';
+              } else if (toolNameLower.includes('tavily')) {
+                mappedAction = 'net_search';
+              }
+            }
+            if (!mappedAction) mappedAction = 'shell_exec';
+
             const stepObj = {
               id: p.id || '',
               action: mappedAction,
@@ -966,7 +1030,11 @@ ${latestUserMessage}
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
           const fnName = tc.function?.name || '';
-          const mappedAction = CC_TO_ACTION_MAP[fnName] || 'shell_exec';
+          let mappedAction = CC_TO_ACTION_MAP[fnName];
+          if (!mappedAction && fnName && fnName.toLowerCase().includes('tavily')) {
+            mappedAction = 'net_search';
+          }
+          if (!mappedAction) mappedAction = 'shell_exec';
           let params = {};
           try {
             params = typeof tc.function?.arguments === 'string'
@@ -1097,8 +1165,10 @@ function buildPrompt(globalTask, historyLogsText) {
    - user_prompt: {"question": "需用户决策的问题", "options": ["选项1", "选项2"]}
    - git_worktree: {"action": "enter|exit", "path": "隔离工作区路径"}
 3. 网络与知识检索：
-   - net_search: {"query": "搜索词"}
-   - net_fetch: {"url": "网址", "prompt": "提取目标"}
+   - net_search: {"query": "搜索词"}（默认快速检索）
+   - net_search2: {"query": "搜索词"}（当需要搜古典古籍、中文冷门资料或 net_search 结果不理想时优先使用）
+   - net_fetch: {"url": "网址", "prompt": "提取目标"}（常规网页读取）
+   - net_fetch2: {"url": "网址", "prompt": "提取目标"}（当 net_fetch 遇到 403、反爬盾、无法访问或要求提取复杂长文本时使用）
 4. 任务编排与治理：
    - task_entry: {"action": "create|update", "title": "任务名", "status": "pending|completed"}
    - subflow_spawn: {"title": "子任务名", "instructions": "分派执行说明"}
@@ -1654,7 +1724,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const startTime = Date.now();
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
-  const { model, messages, stream } = req.body;
+  const { model, messages, stream, tools = [] } = req.body; 
 
   const upstreamAbort = new AbortController();
   let finished = false;
@@ -1824,7 +1894,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       const parsedAction = extractActionAndThought(safeAssistantText, assistantThinking);
     
       if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-        const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+        const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params, tools);
         stopReason = 'tool_use';
     
         const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
@@ -1985,7 +2055,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
-  const { model, messages, stream } = req.body;
+  const { model, messages, stream, tools = [] } = req.body;
 
   const upstreamAbort = new AbortController();
   let finished = false;
@@ -2091,7 +2161,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     let textContent = '';
     
     if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params, tools);
       finishReason = 'tool_calls';
     
       const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
