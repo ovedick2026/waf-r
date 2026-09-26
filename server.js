@@ -184,27 +184,29 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     // 防御性校验：确保 tools 一定是数组，防止下游传非数组导致 .find 报错
     const toolList = Array.isArray(tools) ? tools : [];
     
-    // 动态嗅探 CC 是否挂载了 Tavily 或 Serper MCP
-    const tavilyTool = tools?.find(t => t.name?.toLowerCase().includes('tavily'));
+    // 动态探测客户端真实注入的工具
+    const tavilyTool = tools?.find(t => t.name?.toLowerCase().includes('tavily_search'));
     const serperTool = tools?.find(t => {
       const n = t.name?.toLowerCase() || '';
-      return n.includes('serper') || n.includes('google_search');
+      return n.includes('google_search') || n.includes('serper');
     });
 
-    // 如果调的是 net_search2，优先走 Serper，找不到再兜底 Tavily
+    // 备选 2（Google 镜像深度搜索）
     if (normAction === 'net_search2') {
-      const targetToolName = serperTool ? serperTool.name : (tavilyTool ? tavilyTool.name : 'serper');
       return {
-        name: targetToolName,
-        arguments: { query }
+        // 找到了就用动态名字，找不到兜底使用 Serper 的标准工具名 'google_search'
+        name: serperTool ? serperTool.name : 'google_search',
+        arguments: { q: query, query: query } // 兼容不同库参数 q 或 query
       };
     }
 
-    // 默认 net_search：优先走 Tavily，找不到再兜底走 Serper
-    const targetToolName = tavilyTool ? tavilyTool.name : (serperTool ? serperTool.name : 'tavily');
+    // 默认（Tavily 搜索）
     return {
-      name: targetToolName,
-      arguments: { query }
+      // 必须是具体的工具名 tavily_search，不能是服务名 tavily
+      name: tavilyTool ? tavilyTool.name : 'tavily_search',
+      arguments: { 
+        query: query 
+      }
     };
   }
 
