@@ -106,7 +106,7 @@ function parseTargetUrl(req) {
 // ==========================================
 // 3. Action 与 Claude Code 原生工具适配映射器
 // ==========================================
-function mapActionToClaudeCodeTool(actionName, rawParams) {
+function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
   const normAction = String(actionName || '').trim().toLowerCase();
   const params = rawParams || {};
 
@@ -180,6 +180,9 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
   // ==========================================
   if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
     const query = params.query || '';
+
+    // 防御性校验：确保 tools 一定是数组，防止下游传非数组导致 .find 报错
+    const toolList = Array.isArray(tools) ? tools : [];
     
     // 动态嗅探 CC 是否挂载了 Tavily 或 Serper MCP
     const tavilyTool = tools?.find(t => t.name?.toLowerCase().includes('tavily'));
