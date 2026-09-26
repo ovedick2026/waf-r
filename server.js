@@ -178,34 +178,33 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     // ==========================================
   // 网络搜索：net_search (Tavily优先) 与 net_search2 (Serper优先)
   // ==========================================
-  if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
-    const query = params.query || '';
+  if (normAction === 'net_search' || normAction === 'websearch') {
+    // 动态探测（如果 tools 传进来了就用 tools 里的真实名字）
+    const tavilyTool = tools?.find(t => 
+      t.name && t.name.toLowerCase().includes('tavily') && t.name.toLowerCase().includes('search')
+    );
 
-    // 防御性校验：确保 tools 一定是数组，防止下游传非数组导致 .find 报错
-    const toolList = Array.isArray(tools) ? tools : [];
-    
-    // 动态探测客户端真实注入的工具
-    const tavilyTool = tools?.find(t => t.name?.toLowerCase().includes('tavily_search'));
-    const serperTool = tools?.find(t => {
-      const n = t.name?.toLowerCase() || '';
-      return n.includes('google_search') || n.includes('serper');
-    });
-
-    // 备选 2（Google 镜像深度搜索）
-    if (normAction === 'net_search2') {
-      return {
-        // 找到了就用动态名字，找不到兜底使用 Serper 的标准工具名 'google_search'
-        name: serperTool ? serperTool.name : 'google_search',
-        arguments: { q: query, query: query } // 兼容不同库参数 q 或 query
-      };
-    }
-
-    // 默认（Tavily 搜索）
     return {
-      // 必须是具体的工具名 tavily_search，不能是服务名 tavily
-      name: tavilyTool ? tavilyTool.name : 'tavily_search',
+      // 核心修复点：兜底必须带上 mcp__tavily__ 前缀！
+      name: tavilyTool ? tavilyTool.name : 'mcp__tavily__tavily_search',
       arguments: { 
-        query: query 
+        query: params.query || '' 
+      }
+    };
+  }
+
+  // 备选搜索 net_search2 (Serper) 同理：
+  if (normAction === 'net_search2') {
+    const serperTool = tools?.find(t => 
+      t.name && (t.name.toLowerCase().includes('serper') || t.name.toLowerCase().includes('google_search'))
+    );
+
+    return {
+      // Serper MCP 的标准全名也是带前缀的
+      name: serperTool ? serperTool.name : 'mcp__serper__google_search',
+      arguments: { 
+        query: params.query || '',
+        q: params.query || ''
       }
     };
   }
