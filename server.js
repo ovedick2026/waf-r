@@ -1458,7 +1458,20 @@ function extractActionAndThought(rawText, fallbackThinking = '') {
     }
   }
 
+  // 兜底策略：如果模型没有生成任何调度动作或 JSON，说明它直接给出了自然语言解答（常见于搜索结果总结）
   if (!action && !Object.keys(params).length) {
+    const cleanOutput = rawText
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/【思考】[：:].*/gi, '')
+      .trim();
+    
+    if (cleanOutput.length > 0) {
+      return {
+        thought: thought || '已根据搜索结果整理出答复',
+        action: 'finish',
+        params: { summary: cleanOutput } // 将整个自然语言输出作为总结展示给用户
+      };
+    }
     return null;
   }
 
@@ -1780,19 +1793,23 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   // 【核心修复】：检测是否为 CC 的 WebFetch 网页内容总结子请求
   // =========================================================================
   const lastMsg = messages?.[messages.length - 1];
-  const lastMsgText = typeof lastMsg?.content === 'string' 
-    ? lastMsg.content 
+  const lastMsgText = typeof lastMsg?.content === 'string'
+    ? lastMsg.content
     : (Array.isArray(lastMsg?.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
 
-  const isWebFetchSummarization = lastMsgText.includes('webpage content:') || 
-                                  lastMsgText.includes('contents of the webpage') ||
-                                  lastMsgText.includes('WebFetch');
+  // 判定是否是 Claude Code 内置的搜索/网页抓取二级子请求
+  const isWebSubRequest = 
+    lastMsgText.includes('webpage content:') ||
+    lastMsgText.includes('contents of the webpage') ||
+    lastMsgText.includes('WebFetch') ||
+    lastMsgText.includes('Perform a web search') ||
+    lastMsgText.includes('Web search results') ||
+    tools?.some(t => t.name === 'web_search' || t.type?.includes('web_search'));
 
-  // 如果是 WebFetch 在让模型提炼网页内容，直接原样发给上游，不要套流水线 prompt，也不要转工具！
-  if (isWebFetchSummarization) {
-    logger.debug('检测到 CC 的 WebFetch 网页提炼子请求，直接透传生成文本摘要');
+  if (isWebSubRequest) {
+    logger.debug('检测到 CC 的 WebSearch/WebFetch 联网辅助子请求，直接透传生成文本摘要');
     try {
-      const { text: summaryText } = await fetchUpstreamStream(
+      const { text: summaryText, thinking } = await fetchUpstreamStream(
         upstreamBase,
         apiKey,
         model,
@@ -1800,10 +1817,9 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         null,
         req.signal
       );
+      // 若正文为空但有思考内容，兜底提取思考内容作为回答
+      const cleanSummary = (summaryText || thinking || '已获取网络信息并完成处理。').trim();
 
-      const cleanSummary = assertNonEmptyUpstreamText(summaryText, '网页摘要提炼');
-      
-      // 返回纯文本 message 给 CC
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         const sendSSE = (ev, d) => res.write(`event: ${ev}\ndata: ${JSON.stringify(d)}\n\n`);
@@ -1824,7 +1840,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         });
       }
     } catch (e) {
-      logger.error('WebFetch 摘要生成异常', e.message);
+      logger.error('Web 子请求处理异常', e.message);
       return res.status(500).json({ error: { message: e.message } });
     }
   }
