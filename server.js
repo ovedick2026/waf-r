@@ -175,7 +175,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
 
-    // ==========================================
+  // ==========================================
   // 网络搜索：net_search (Tavily) 与 net_search2 (Serper)
   // ==========================================
   if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
@@ -211,6 +211,25 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     return {
       name: targetTool.name,
       arguments: { query, q: query }
+    };
+  }
+
+  // ==========================================
+  // 网页抓取：net_fetch 与 net_fetch2 (Jina)
+  // ==========================================
+  if (normAction === 'net_fetch' || normAction === 'net_fetch2' || normAction === 'webfetch') {
+    let targetUrl = params.url || '';
+    if (normAction === 'net_fetch2') {
+      if (targetUrl && !targetUrl.startsWith('https://r.jina.ai/')) {
+        targetUrl = `https://r.jina.ai/${targetUrl}`;
+      }
+    }
+    return {
+      name: 'WebFetch',
+      arguments: {
+        url: targetUrl,
+        prompt: params.prompt || '提取全部有效正文内容，如果是榜单请列出前10项标题'
+      }
     };
   }
 
@@ -1756,6 +1775,59 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
   const { model, messages, stream, tools = [] } = req.body; 
+
+  // =========================================================================
+  // 【核心修复】：检测是否为 CC 的 WebFetch 网页内容总结子请求
+  // =========================================================================
+  const lastMsg = messages?.[messages.length - 1];
+  const lastMsgText = typeof lastMsg?.content === 'string' 
+    ? lastMsg.content 
+    : (Array.isArray(lastMsg?.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
+
+  const isWebFetchSummarization = lastMsgText.includes('webpage content:') || 
+                                  lastMsgText.includes('contents of the webpage') ||
+                                  lastMsgText.includes('WebFetch');
+
+  // 如果是 WebFetch 在让模型提炼网页内容，直接原样发给上游，不要套流水线 prompt，也不要转工具！
+  if (isWebFetchSummarization) {
+    logger.debug('检测到 CC 的 WebFetch 网页提炼子请求，直接透传生成文本摘要');
+    try {
+      const { text: summaryText } = await fetchUpstreamStream(
+        upstreamBase,
+        apiKey,
+        model,
+        lastMsgText,
+        null,
+        req.signal
+      );
+
+      const cleanSummary = assertNonEmptyUpstreamText(summaryText, '网页摘要提炼');
+      
+      // 返回纯文本 message 给 CC
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        const sendSSE = (ev, d) => res.write(`event: ${ev}\ndata: ${JSON.stringify(d)}\n\n`);
+        sendSSE('message_start', { type: 'message_start', message: { id: 'msg_' + Date.now(), role: 'assistant', content: [] } });
+        sendSSE('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+        sendSSE('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: cleanSummary } });
+        sendSSE('content_block_stop', { type: 'content_block_stop', index: 0 });
+        sendSSE('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } });
+        sendSSE('message_stop', { type: 'message_stop' });
+        return res.end();
+      } else {
+        return res.json({
+          id: 'msg_' + Date.now(),
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: cleanSummary }],
+          stop_reason: 'end_turn'
+        });
+      }
+    } catch (e) {
+      logger.error('WebFetch 摘要生成异常', e.message);
+      return res.status(500).json({ error: { message: e.message } });
+    }
+  }
 
   const upstreamAbort = new AbortController();
   let finished = false;
