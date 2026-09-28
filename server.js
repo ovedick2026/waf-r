@@ -1139,16 +1139,16 @@ ${latestUserMessage}
             
                   if (Array.isArray(list)) {
                     // 只提炼标题、链接和精简摘要（每条摘要限 150 字）
-                    cleanFeedback = list.slice(0, 5).map((item, idx) => {
+                    cleanFeedback = list.slice(0, 8).map((item, idx) => {
                       const title = item.title || '无标题';
                       const url = item.url || item.link || '';
-                      const snippet = (item.content || item.snippet || '').slice(0, 150);
-                      return `[${idx + 1}] ${title}\n    链接: ${url}\n    摘要: ${snippet}`;
+                      const snippet = (item.content || item.snippet || '').slice(0, 1000);
+                      return `[${idx + 1}] 标题: ${title}\n    链接: ${url}\n    摘要: ${snippet}`;
                     }).join('\n\n');
                   }
                 } catch (e) {
                   // 非合法 JSON 则直接截取合理长度
-                  cleanFeedback = cleanFeedback.slice(0, 3000);
+                  cleanFeedback = cleanFeedback.slice(0, 10000);
                 }
               }
               rawSteps.push({ ...matchedStep, feedback: cleanFeedback });
@@ -1833,50 +1833,52 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   // 2. 关键判定：如果是 MCP 工具执行结果的回传（带有 tool_result），绝不能当成二级子请求拦截！
   const hasToolResult = Array.isArray(lastMsg?.content) && lastMsg.content.some(c => c.type === 'tool_result');
 
-  const isWebSubRequest = !hasToolResult && (
-    lastMsgText.includes('webpage content:') ||
-    lastMsgText.includes('contents of the webpage') ||
-    lastMsgText.includes('Perform a web search')
-  );
+  const isWebSubRequest = false; 
 
-  if (isWebSubRequest) {
-    logger.debug('检测到 CC 的 WebSearch/WebFetch 联网辅助子请求，直接透传生成文本摘要');
-    try {
-      const { text: summaryText, thinking } = await fetchUpstreamStream(
-        upstreamBase,
-        apiKey,
-        model,
-        lastMsgText,
-        null,
-        req.signal
-      );
-      // 若正文为空但有思考内容，兜底提取思考内容作为回答
-      const cleanSummary = (summaryText || thinking || '已获取网络信息并完成处理。').trim();
+  // const isWebSubRequest = !hasToolResult && (
+  //   lastMsgText.includes('webpage content:') ||
+  //   lastMsgText.includes('contents of the webpage') ||
+  //   lastMsgText.includes('Perform a web search')
+  // );
 
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        const sendSSE = (ev, d) => res.write(`event: ${ev}\ndata: ${JSON.stringify(d)}\n\n`);
-        sendSSE('message_start', { type: 'message_start', message: { id: 'msg_' + Date.now(), role: 'assistant', content: [] } });
-        sendSSE('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-        sendSSE('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: cleanSummary } });
-        sendSSE('content_block_stop', { type: 'content_block_stop', index: 0 });
-        sendSSE('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } });
-        sendSSE('message_stop', { type: 'message_stop' });
-        return res.end();
-      } else {
-        return res.json({
-          id: 'msg_' + Date.now(),
-          type: 'message',
-          role: 'assistant',
-          content: [{ type: 'text', text: cleanSummary }],
-          stop_reason: 'end_turn'
-        });
-      }
-    } catch (e) {
-      logger.error('Web 子请求处理异常', e.message);
-      return res.status(500).json({ error: { message: e.message } });
-    }
-  }
+  // if (isWebSubRequest) {
+  //   logger.debug('检测到 CC 的 WebSearch/WebFetch 联网辅助子请求，直接透传生成文本摘要');
+  //   try {
+  //     const { text: summaryText, thinking } = await fetchUpstreamStream(
+  //       upstreamBase,
+  //       apiKey,
+  //       model,
+  //       lastMsgText,
+  //       null,
+  //       req.signal
+  //     );
+  //     // 若正文为空但有思考内容，兜底提取思考内容作为回答
+  //     const cleanSummary = (summaryText || thinking || '已获取网络信息并完成处理。').trim();
+
+  //     if (stream) {
+  //       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  //       const sendSSE = (ev, d) => res.write(`event: ${ev}\ndata: ${JSON.stringify(d)}\n\n`);
+  //       sendSSE('message_start', { type: 'message_start', message: { id: 'msg_' + Date.now(), role: 'assistant', content: [] } });
+  //       sendSSE('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  //       sendSSE('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: cleanSummary } });
+  //       sendSSE('content_block_stop', { type: 'content_block_stop', index: 0 });
+  //       sendSSE('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } });
+  //       sendSSE('message_stop', { type: 'message_stop' });
+  //       return res.end();
+  //     } else {
+  //       return res.json({
+  //         id: 'msg_' + Date.now(),
+  //         type: 'message',
+  //         role: 'assistant',
+  //         content: [{ type: 'text', text: cleanSummary }],
+  //         stop_reason: 'end_turn'
+  //       });
+  //     }
+  //   } catch (e) {
+  //     logger.error('Web 子请求处理异常', e.message);
+  //     return res.status(500).json({ error: { message: e.message } });
+  //   }
+  // }
 
   const upstreamAbort = new AbortController();
   let finished = false;
@@ -2220,85 +2222,87 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     lastMsgText = lastMsg.content.map(c => c.text || c.content || '').join('\n');
   }
 
+  const isWebSubRequest = false; 
+
   // 严谨匹配 CC 的 WebFetch 提取模板（带空格容错）与无工具特征
-  const isWebSubRequest =
-    (!tools || tools.length === 0) &&
-    (/web\s*page\s*content/i.test(lastMsgText) ||
-     /contents?\s+of\s+(?:the\s+)?web\s*page/i.test(lastMsgText) ||
-     /Provide a concise response based/i.test(lastMsgText) ||
-     lastMsgText.includes('r.jina.ai') ||
-     lastMsgText.includes('WebFetch'));
+  // const isWebSubRequest =
+  //   (!tools || tools.length === 0) &&
+  //   (/web\s*page\s*content/i.test(lastMsgText) ||
+  //    /contents?\s+of\s+(?:the\s+)?web\s*page/i.test(lastMsgText) ||
+  //    /Provide a concise response based/i.test(lastMsgText) ||
+  //    lastMsgText.includes('r.jina.ai') ||
+  //    lastMsgText.includes('WebFetch'));
 
-  if (isWebSubRequest) {
-    logger.debug('检测到 CC 的 WebFetch 网页提取二级子请求（ChatCompletions），直接透传正文提取');
-    try {
-      const { text: summaryText, thinking } = await fetchUpstreamStream(
-        upstreamBase,
-        apiKey,
-        model,
-        lastMsgText,
-        null,
-        req.signal
-      );
+  // if (isWebSubRequest) {
+  //   logger.debug('检测到 CC 的 WebFetch 网页提取二级子请求（ChatCompletions），直接透传正文提取');
+  //   try {
+  //     const { text: summaryText, thinking } = await fetchUpstreamStream(
+  //       upstreamBase,
+  //       apiKey,
+  //       model,
+  //       lastMsgText,
+  //       null,
+  //       req.signal
+  //     );
 
-      const cleanSummary = (summaryText || thinking || '已获取网页内容。').trim();
+  //     const cleanSummary = (summaryText || thinking || '已获取网页内容。').trim();
 
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.flushHeaders?.();
+  //     if (stream) {
+  //       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  //       res.setHeader('Cache-Control', 'no-cache, no-transform');
+  //       res.setHeader('Connection', 'keep-alive');
+  //       res.flushHeaders?.();
 
-        // 1. 发送角色与提取的正文内容
-        res.write(`data: ${JSON.stringify({
-          id: 'chatcmpl-web-' + Date.now(),
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: { role: 'assistant', content: cleanSummary } }]
-        })}\n\n`);
+  //       // 1. 发送角色与提取的正文内容
+  //       res.write(`data: ${JSON.stringify({
+  //         id: 'chatcmpl-web-' + Date.now(),
+  //         object: 'chat.completion.chunk',
+  //         created: Math.floor(Date.now() / 1000),
+  //         model,
+  //         choices: [{ index: 0, delta: { role: 'assistant', content: cleanSummary } }]
+  //       })}\n\n`);
 
-        // 2. 正常以 stop 结束
-        res.write(`data: ${JSON.stringify({
-          id: 'chatcmpl-web-' + Date.now(),
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-        })}\n\n`);
+  //       // 2. 正常以 stop 结束
+  //       res.write(`data: ${JSON.stringify({
+  //         id: 'chatcmpl-web-' + Date.now(),
+  //         object: 'chat.completion.chunk',
+  //         created: Math.floor(Date.now() / 1000),
+  //         model,
+  //         choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+  //       })}\n\n`);
 
-        res.write('data: [DONE]\n\n');
-        return res.end();
-      } else {
-        return res.json({
-          id: 'chatcmpl-web-' + Date.now(),
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{
-            index: 0,
-            message: { role: 'assistant', content: cleanSummary },
-            finish_reason: 'stop'
-          }],
-          usage: { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 }
-        });
-      }
-    } catch (e) {
-      logger.error('WebFetch 子请求处理异常', e.message);
-      if (stream) {
-        res.write(`data: ${JSON.stringify({
-          id: 'chatcmpl-err',
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: { content: `[网页抓取失败: ${e.message}]` }, finish_reason: 'stop' }]
-        })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        return res.end();
-      }
-      return res.status(500).json({ error: { message: e.message } });
-    }
-  }
+  //       res.write('data: [DONE]\n\n');
+  //       return res.end();
+  //     } else {
+  //       return res.json({
+  //         id: 'chatcmpl-web-' + Date.now(),
+  //         object: 'chat.completion',
+  //         created: Math.floor(Date.now() / 1000),
+  //         model,
+  //         choices: [{
+  //           index: 0,
+  //           message: { role: 'assistant', content: cleanSummary },
+  //           finish_reason: 'stop'
+  //         }],
+  //         usage: { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 }
+  //       });
+  //     }
+  //   } catch (e) {
+  //     logger.error('WebFetch 子请求处理异常', e.message);
+  //     if (stream) {
+  //       res.write(`data: ${JSON.stringify({
+  //         id: 'chatcmpl-err',
+  //         object: 'chat.completion.chunk',
+  //         created: Math.floor(Date.now() / 1000),
+  //         model,
+  //         choices: [{ index: 0, delta: { content: `[网页抓取失败: ${e.message}]` }, finish_reason: 'stop' }]
+  //       })}\n\n`);
+  //       res.write('data: [DONE]\n\n');
+  //       return res.end();
+  //     }
+  //     return res.status(500).json({ error: { message: e.message } });
+  //   }
+  // }
 
   const upstreamAbort = new AbortController();
   let finished = false;
