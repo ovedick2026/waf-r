@@ -184,28 +184,27 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     const getToolName = (t) => (t?.name || t?.function?.name || '').toLowerCase();
     const getRealToolName = (t) => t?.name || t?.function?.name || '';
 
-    // 1. 获取所有工具
     const allTools = tools || [];
 
-    // 2. 精确查找 Tavily 的【搜索】工具（严厉排除 crawl, extract, context 等非搜索接口）
+    // 1. 【严密强匹配】：Tavily 必须同时包含 tavily 和 search，坚决杜绝 map/crawl/extract
     const tavilySearchTool = allTools.find(t => {
       const n = getToolName(t);
-      return n.includes('tavily') && (n.includes('search') || !n.includes('crawl') && !n.includes('extract'));
+      return n.includes('tavily') && n.includes('search');
     });
 
-    // 3. 精确查找 Serper / Google 搜索工具
+    // 2. 【严密强匹配】：Serper / Google 搜索工具
     const serperSearchTool = allTools.find(t => {
       const n = getToolName(t);
-      return n.includes('serper') || n.includes('google');
+      return (n.includes('serper') || n.includes('google')) && !n.includes('crawl');
     });
 
-    // 4. 兜底搜索工具（排查任何带 search 的工具，但排除系统默认指令）
+    // 3. 通用搜索兜底（必须带 search 且排除系统的文件/命令工具）
     const fallbackSearchTool = allTools.find(t => {
       const n = getToolName(t);
       return n.includes('search') && !['bash', 'read', 'write', 'edit'].includes(n);
     });
 
-    // 5. 分流调度：net_search 优先 Tavily，net_search2 优先 Serper
+    // 4. 分流调度
     let targetTool = null;
     if (normAction === 'net_search2') {
       targetTool = serperSearchTool || tavilySearchTool || fallbackSearchTool;
@@ -215,18 +214,18 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     } else {
       targetTool = tavilySearchTool || serperSearchTool || fallbackSearchTool;
       if (!targetTool) {
-        throw new Error(`CC 未挂载 Tavily 搜索 MCP 工具，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
+        throw new Error(`CC 未挂载 Tavily 搜索 MCP (需含 search)，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
       }
     }
 
     const realName = getRealToolName(targetTool);
     const lowerName = realName.toLowerCase();
 
-    // 6. 【参数严格分流】：按工具类型分别封装入参
+    // 5. 按选中工具精确组装入参
     let searchArgs = {};
 
     if (lowerName.includes('serper') || lowerName.includes('google')) {
-      // Serper 强校验 region 和 language
+      // Serper 强制要求的 region 和 language
       searchArgs = {
         q: query,
         query: query,
@@ -238,17 +237,10 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
         hl: params.hl || 'zh-cn',
         language_code: params.language_code || 'zh-cn'
       };
-    } else if (lowerName.includes('tavily')) {
-      // Tavily 官方搜索纯净入参，严禁塞入 region/country/url 避免被判定为 crawl
-      searchArgs = {
-        query: query,
-        search_depth: params.search_depth || 'basic'
-      };
     } else {
-      // 其他搜索工具通用兜底
+      // Tavily 及其他标准搜索：仅传 query，绝不传任何多余字段防踩坑
       searchArgs = {
-        query: query,
-        q: query
+        query: query
       };
     }
 
@@ -272,7 +264,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
       name: 'WebFetch',
       arguments: {
         url: targetUrl,
-        prompt: params.prompt || '提取该页面的全部文言文正文和逐段译文，保留原文完整段落。'
+        prompt: params.prompt || '提取该页面的全部正文，保留原文完整段落。'
       }
     };
   }
@@ -1243,7 +1235,7 @@ function buildPrompt(globalTask, historyLogsText) {
    - net_search: {"query": "搜索词"}（默认快速检索）
    - net_search2: {"query": "搜索词"}（备用联网搜索）
    - net_fetch: {"url": "网址", "prompt": "提取目标"}（常规网页读取）
-   - net_fetch2: {"url": "网址", "prompt": "提取目标"}（备用网页读取）
+   - net_fetch2: {"url": "网址", "prompt": "提取目标"}（当 net_fetch 遇到 403、反爬盾、无法访问或要求提取复杂长文本时使用）
 4. 任务编排与治理：
    - task_entry: {"action": "create|update", "title": "任务名", "status": "pending|completed"}
    - subflow_spawn: {"title": "子任务名", "instructions": "分派执行说明"}
