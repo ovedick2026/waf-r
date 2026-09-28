@@ -1792,19 +1792,29 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   // =========================================================================
   // 【核心修复】：检测是否为 CC 的 WebFetch 网页内容总结子请求
   // =========================================================================
+  // 1. 健壮提取 lastMsgText，兼容普通文本与 MCP 的 tool_result 回传
   const lastMsg = messages?.[messages.length - 1];
-  const lastMsgText = typeof lastMsg?.content === 'string'
-    ? lastMsg.content
-    : (Array.isArray(lastMsg?.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
+  let lastMsgText = '';
+  if (typeof lastMsg?.content === 'string') {
+    lastMsgText = lastMsg.content;
+  } else if (Array.isArray(lastMsg?.content)) {
+    lastMsgText = lastMsg.content.map(c => {
+      if (c.type === 'text') return c.text || '';
+      if (c.type === 'tool_result') {
+        return typeof c.content === 'string' ? c.content : JSON.stringify(c.content || '');
+      }
+      return '';
+    }).filter(Boolean).join('\n');
+  }
 
-  // 判定是否是 Claude Code 内置的搜索/网页抓取二级子请求
-  const isWebSubRequest = 
+  // 2. 关键判定：如果是 MCP 工具执行结果的回传（带有 tool_result），绝不能当成二级子请求拦截！
+  const hasToolResult = Array.isArray(lastMsg?.content) && lastMsg.content.some(c => c.type === 'tool_result');
+
+  const isWebSubRequest = !hasToolResult && (
     lastMsgText.includes('webpage content:') ||
     lastMsgText.includes('contents of the webpage') ||
-    lastMsgText.includes('WebFetch') ||
-    lastMsgText.includes('Perform a web search') ||
-    lastMsgText.includes('Web search results') ||
-    tools?.some(t => t.name === 'web_search' || t.type?.includes('web_search'));
+    lastMsgText.includes('Perform a web search')
+  );
 
   if (isWebSubRequest) {
     logger.debug('检测到 CC 的 WebSearch/WebFetch 联网辅助子请求，直接透传生成文本摘要');
@@ -2050,13 +2060,13 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (stream) {
       // 把最终文本写进一直保持打开的块 0，然后关闭它
       if (textBlockOpen) {
-        if (textContent) {
-          sendSSE('content_block_delta', {
-            type: 'content_block_delta',
-            index: 0,
-            delta: { type: 'text_delta', text: textContent }
-          });
-        }
+        // 保证 textContent 至少有可见文本，防止被 CC 看门狗判空
+        const finalText = textContent || (toolBlock ? `调度工具: ${toolBlock.name}` : '处理完成');
+        sendSSE('content_block_delta', {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: finalText }
+        });
         sendSSE('content_block_stop', {
           type: 'content_block_stop',
           index: 0
