@@ -179,29 +179,37 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
   // 网络搜索：net_search (Tavily) 与 net_search2 (Serper)
   // ==========================================
   if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
-    const query = params.query || params.q || '';
+    const query = params.query || params.q || params.input || '';
 
     const getToolName = (t) => (t?.name || t?.function?.name || '').toLowerCase();
     const getRealToolName = (t) => t?.name || t?.function?.name || '';
 
     const allTools = tools || [];
 
-    // 1. 【严密强匹配】：Tavily 必须同时包含 tavily 和 search，坚决杜绝 map/crawl/extract
+    // 1. 【核心修复】：精准匹配 Tavily 普通搜索
+    // 坚决排除 research（包含search子串）、crawl、map、extract！
     const tavilySearchTool = allTools.find(t => {
       const n = getToolName(t);
-      return n.includes('tavily') && n.includes('search');
+      const isNotOther = !n.includes('research') && !n.includes('crawl') && !n.includes('map') && !n.includes('extract');
+      // 精确匹配 tavily_search 或带有 search 且不是 research 的工具
+      return n.includes('tavily') && isNotOther && (n.endsWith('search') || n.includes('search_') || n.includes('_search'));
+    }) || allTools.find(t => {
+      const n = getToolName(t);
+      return n.includes('tavily') && !n.includes('research') && !n.includes('crawl') && !n.includes('map') && !n.includes('extract');
     });
 
-    // 2. 【严密强匹配】：Serper / Google 搜索工具
+    // 2. 精准匹配 Serper / Google 搜索
     const serperSearchTool = allTools.find(t => {
       const n = getToolName(t);
-      return (n.includes('serper') || n.includes('google')) && !n.includes('crawl');
+      return (n.includes('serper') || n.includes('google')) && !n.includes('crawl') && !n.includes('research');
     });
 
-    // 3. 通用搜索兜底（必须带 search 且排除系统的文件/命令工具）
+    // 3. 通用搜索兜底（必须排除 research 以及系统的文件/命令工具）
     const fallbackSearchTool = allTools.find(t => {
       const n = getToolName(t);
-      return n.includes('search') && !['bash', 'read', 'write', 'edit'].includes(n);
+      return (n.endsWith('search') || n.includes('_search') || n.includes('search_')) && 
+             !n.includes('research') && 
+             !['bash', 'read', 'write', 'edit'].includes(n);
     });
 
     // 4. 分流调度
@@ -214,18 +222,18 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     } else {
       targetTool = tavilySearchTool || serperSearchTool || fallbackSearchTool;
       if (!targetTool) {
-        throw new Error(`CC 未挂载 Tavily 搜索 MCP (需含 search)，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
+        throw new Error(`CC 未挂载 Tavily 搜索 MCP (普通搜索，非 research)，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
       }
     }
 
     const realName = getRealToolName(targetTool);
     const lowerName = realName.toLowerCase();
 
-    // 5. 按选中工具精确组装入参
+    // 5. 按工具精准装配入参
     let searchArgs = {};
 
     if (lowerName.includes('serper') || lowerName.includes('google')) {
-      // Serper 强制要求的 region 和 language
+      // Serper 严格入参
       searchArgs = {
         q: query,
         query: query,
@@ -237,8 +245,14 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
         hl: params.hl || 'zh-cn',
         language_code: params.language_code || 'zh-cn'
       };
+    } else if (lowerName.includes('research')) {
+      // 如果万一确实只有 research 工具可用，则补上它要求的 input 字段防报错
+      searchArgs = {
+        input: query,
+        query: query
+      };
     } else {
-      // Tavily 及其他标准搜索：仅传 query，绝不传任何多余字段防踩坑
+      // Tavily 普通 search 纯净入参
       searchArgs = {
         query: query
       };
