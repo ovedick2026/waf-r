@@ -175,19 +175,21 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
 
-  // ==========================================
+    // ==========================================
   // 网络搜索：net_search (Tavily) 与 net_search2 (Serper)
   // ==========================================
   if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
     const query = params.query || params.q || '';
 
+    // 【核心修复】：兼容 Claude 格式 (t.name) 与 OpenAI 格式 (t.function.name)
+    const getToolName = (t) => (t?.name || t?.function?.name || '').toLowerCase();
+    const getRealToolName = (t) => t?.name || t?.function?.name || '';
+
     // 1. 动态搜寻 CC 当前注入的所有工具
-    // 凡是包含 tavily 的，不管它全名叫 mcp__tavily__tavily_search 还是别的，一律命中
-    const tavilyTool = tools?.find(t => t.name?.toLowerCase().includes('tavily'));
-    
-    // 凡是包含 serper 或 google 的，一律命中
+    const tavilyTool = tools?.find(t => getToolName(t).includes('tavily'));
+
     const serperTool = tools?.find(t => {
-      const n = t.name?.toLowerCase() || '';
+      const n = getToolName(t);
       return n.includes('serper') || n.includes('google');
     });
 
@@ -195,21 +197,20 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     if (normAction === 'net_search2') {
       const targetTool = serperTool || tavilyTool;
       if (!targetTool) {
-        throw new Error(`CC 未挂载 Serper 或 Tavily MCP 工具，可用工具列表: ${tools?.map(t => t.name).join(', ')}`);
+        throw new Error(`CC 未挂载 Serper 或 Tavily MCP 工具，可用工具列表: ${tools?.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
       }
       return {
-        name: targetTool.name, // 使用 CC 自己传上来的真实合法全名！
+        name: getRealToolName(targetTool), // 取出真实的完整工具名
         arguments: { query, q: query }
       };
     }
-
     // 默认 net_search
     const targetTool = tavilyTool || serperTool;
     if (!targetTool) {
-      throw new Error(`CC 未挂载任何搜索 MCP，可用工具列表: ${tools?.map(t => t.name).join(', ')}`);
+      throw new Error(`CC 未挂载任何搜索 MCP，可用工具列表: ${tools?.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
     }
     return {
-      name: targetTool.name,
+      name: getRealToolName(targetTool),
       arguments: { query, q: query }
     };
   }
@@ -2413,6 +2414,19 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     } else if (!res.headersSent) {
       res.status(500).json({ error: { message: err.message } });
     } else {
+      // 【核心修复】：流响应头已经发出时，向客户端输出错误文本，防止流为空导致 CC 报 [no visible output]
+      res.write(`data: ${JSON.stringify({
+        id: 'chatcmpl-err',
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          delta: { content: `\n[代理执行异常]: ${err.message}\n` },
+          finish_reason: 'stop',
+          index: 0
+        }]
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
       res.end();
     }
   } finally {
