@@ -175,8 +175,8 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
 
-  // ==========================================
-  // 网络搜索：net_search (主搜索) 与 net_search2 (备用搜索)
+    // ==========================================
+  // 网络搜索：net_search (Tavily) 与 net_search2 (Serper)
   // ==========================================
   if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
     const query = params.query || params.q || '';
@@ -184,50 +184,73 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     const getToolName = (t) => (t?.name || t?.function?.name || '').toLowerCase();
     const getRealToolName = (t) => t?.name || t?.function?.name || '';
 
-    // 1. 过滤出 CC 挂载的所有具备搜索能力的工具（排除内置的 bash/read/write/edit 等）
-    const searchTools = tools?.filter(t => {
-      const n = getToolName(t);
-      return !['bash', 'read', 'write', 'edit', 'agent', 'notebookedit', 'askuserquestion'].includes(n) &&
-             (n.includes('search') || n.includes('serper') || n.includes('tavily') || n.includes('google') || n.includes('web'));
-    }) || [];
+    // 1. 获取所有工具
+    const allTools = tools || [];
 
-    // 2. 精准定位 Tavily 与 Serper
-    const tavilyTool = searchTools.find(t => getToolName(t).includes('tavily'));
-    const serperTool = searchTools.find(t => {
+    // 2. 精确查找 Tavily 的【搜索】工具（严厉排除 crawl, extract, context 等非搜索接口）
+    const tavilySearchTool = allTools.find(t => {
+      const n = getToolName(t);
+      return n.includes('tavily') && (n.includes('search') || !n.includes('crawl') && !n.includes('extract'));
+    });
+
+    // 3. 精确查找 Serper / Google 搜索工具
+    const serperSearchTool = allTools.find(t => {
       const n = getToolName(t);
       return n.includes('serper') || n.includes('google');
     });
 
-    // 3. 区分主搜与备用搜：net_search 走主搜，net_search2 走备用搜
+    // 4. 兜底搜索工具（排查任何带 search 的工具，但排除系统默认指令）
+    const fallbackSearchTool = allTools.find(t => {
+      const n = getToolName(t);
+      return n.includes('search') && !['bash', 'read', 'write', 'edit'].includes(n);
+    });
+
+    // 5. 分流调度：net_search 优先 Tavily，net_search2 优先 Serper
     let targetTool = null;
     if (normAction === 'net_search2') {
-      // 备用优先：Serper -> searchTools[1] -> Tavily -> searchTools[0]
-      targetTool = serperTool || searchTools[1] || tavilyTool || searchTools[0];
+      targetTool = serperSearchTool || tavilySearchTool || fallbackSearchTool;
+      if (!targetTool) {
+        throw new Error(`CC 未挂载 Serper MCP 工具，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
+      }
     } else {
-      // 默认优先：Tavily -> searchTools[0] -> Serper -> searchTools[1]
-      targetTool = tavilyTool || searchTools[0] || serperTool || searchTools[1];
-    }
-
-    if (!targetTool) {
-      throw new Error(`CC 未挂载任何搜索 MCP，可用工具列表: ${tools?.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
+      targetTool = tavilySearchTool || serperSearchTool || fallbackSearchTool;
+      if (!targetTool) {
+        throw new Error(`CC 未挂载 Tavily 搜索 MCP 工具，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
+      }
     }
 
     const realName = getRealToolName(targetTool);
     const lowerName = realName.toLowerCase();
 
-    // 4. 【核心修复】：为 Serper/Google 类搜索补齐必须的 region 和 language 参数
-    const searchArgs = {
-      query,
-      q: query,
-      // 补全 Serper 必须的地区与语言入参，同时兼容各种常见别名
-      country: params.country || 'cn',
-      gl: params.gl || 'cn',
-      region: params.region || 'cn',
-      region_code: params.region_code || 'cn',
-      language: params.language || 'zh-cn',
-      hl: params.hl || 'zh-cn',
-      language_code: params.language_code || 'zh-cn'
-    };
+    // 6. 【参数严格分流】：按工具类型分别封装入参
+    let searchArgs = {};
+
+    if (lowerName.includes('serper') || lowerName.includes('google')) {
+      // Serper 强校验 region 和 language
+      searchArgs = {
+        q: query,
+        query: query,
+        country: params.country || 'cn',
+        gl: params.gl || 'cn',
+        region: params.region || 'cn',
+        region_code: params.region_code || 'cn',
+        language: params.language || 'zh-cn',
+        hl: params.hl || 'zh-cn',
+        language_code: params.language_code || 'zh-cn'
+      };
+    } else if (lowerName.includes('tavily')) {
+      // Tavily 官方搜索纯净入参，严禁塞入 region/country/url 避免被判定为 crawl
+      searchArgs = {
+        query: query,
+        search_depth: params.search_depth || 'basic'
+      };
+    } else {
+      // 其他搜索工具通用兜底
+      searchArgs = {
+        query: query,
+        q: query
+      };
+    }
 
     return {
       name: realName,
@@ -238,7 +261,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
   // ==========================================
   // 网页抓取：net_fetch 与 net_fetch2 (Jina)
   // ==========================================
-  if (normAction === 'net_fetch' || normAction === 'net_fetch2' || normAction === 'webfetch') {
+    if (normAction === 'net_fetch' || normAction === 'net_fetch2' || normAction === 'webfetch') {
     let targetUrl = params.url || '';
     if (normAction === 'net_fetch2') {
       if (targetUrl && !targetUrl.startsWith('https://r.jina.ai/')) {
@@ -249,26 +272,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
       name: 'WebFetch',
       arguments: {
         url: targetUrl,
-        prompt: params.prompt || '提取全部有效正文内容，如果是榜单请列出前10项标题'
-      }
-    };
-  }
-
-  // ==========================================
-  // 网页抓取：net_fetch 与 net_fetch2 (Jina)
-  // ==========================================
-  if (normAction === 'net_fetch' || normAction === 'net_fetch2' || normAction === 'webfetch') {
-    let targetUrl = params.url || '';
-    if (normAction === 'net_fetch2') {
-      if (targetUrl && !targetUrl.startsWith('https://r.jina.ai/')) {
-        targetUrl = `https://r.jina.ai/${targetUrl}`;
-      }
-    }
-    return {
-      name: 'WebFetch',
-      arguments: {
-        url: targetUrl,
-        prompt: params.prompt || '提取全部有效正文内容，如果是榜单请列出前10项标题'
+        prompt: params.prompt || '提取该页面的全部文言文正文和逐段译文，保留原文完整段落。'
       }
     };
   }
@@ -2207,6 +2211,97 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
   const { model, messages, stream, tools = [] } = req.body;
+
+  // =========================================================================
+  // 【核心修复】：检测并拦截 Claude Code 的 WebFetch / 网页总结二级子请求
+  // =========================================================================
+  const lastMsg = messages?.[messages.length - 1];
+  let lastMsgText = '';
+  if (typeof lastMsg?.content === 'string') {
+    lastMsgText = lastMsg.content;
+  } else if (Array.isArray(lastMsg?.content)) {
+    lastMsgText = lastMsg.content.map(c => c.text || c.content || '').join('\n');
+  }
+
+  // 严谨匹配 CC 的 WebFetch 提取模板（带空格容错）与无工具特征
+  const isWebSubRequest =
+    (!tools || tools.length === 0) &&
+    (/web\s*page\s*content/i.test(lastMsgText) ||
+     /contents?\s+of\s+(?:the\s+)?web\s*page/i.test(lastMsgText) ||
+     /Provide a concise response based/i.test(lastMsgText) ||
+     lastMsgText.includes('r.jina.ai') ||
+     lastMsgText.includes('WebFetch'));
+
+  if (isWebSubRequest) {
+    logger.debug('检测到 CC 的 WebFetch 网页提取二级子请求（ChatCompletions），直接透传正文提取');
+    try {
+      const { text: summaryText, thinking } = await fetchUpstreamStream(
+        upstreamBase,
+        apiKey,
+        model,
+        lastMsgText,
+        null,
+        req.signal
+      );
+
+      const cleanSummary = (summaryText || thinking || '已获取网页内容。').trim();
+
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders?.();
+
+        // 1. 发送角色与提取的正文内容
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-web-' + Date.now(),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { role: 'assistant', content: cleanSummary } }]
+        })}\n\n`);
+
+        // 2. 正常以 stop 结束
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-web-' + Date.now(),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        })}\n\n`);
+
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      } else {
+        return res.json({
+          id: 'chatcmpl-web-' + Date.now(),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: cleanSummary },
+            finish_reason: 'stop'
+          }],
+          usage: { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 }
+        });
+      }
+    } catch (e) {
+      logger.error('WebFetch 子请求处理异常', e.message);
+      if (stream) {
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-err',
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { content: `[网页抓取失败: ${e.message}]` }, finish_reason: 'stop' }]
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+      return res.status(500).json({ error: { message: e.message } });
+    }
+  }
 
   const upstreamAbort = new AbortController();
   let finished = false;
