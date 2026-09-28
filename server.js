@@ -175,115 +175,115 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
 
-    // ==========================================
+  // ==========================================
   // 网络搜索：net_search (Tavily) 与 net_search2 (Serper)
   // ==========================================
   if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
-    const query = params.query || params.q || params.input || '';
-
+    const query = (params.query || params.q || params.input || '').trim();
+    
+    if (!query) {
+      throw new Error('搜索失败：搜索关键词 (query) 不能为空。');
+    }
+  
     const getToolName = (t) => (t?.name || t?.function?.name || '').toLowerCase();
     const getRealToolName = (t) => t?.name || t?.function?.name || '';
-
+  
     const allTools = tools || [];
-
-    // 1. 【核心修复】：精准匹配 Tavily 普通搜索
-    // 坚决排除 research（包含search子串）、crawl、map、extract！
+  
+    // 1. 【精准匹配 Tavily 普通搜索】
     const tavilySearchTool = allTools.find(t => {
       const n = getToolName(t);
-      const isNotOther = !n.includes('research') && !n.includes('crawl') && !n.includes('map') && !n.includes('extract');
-      // 精确匹配 tavily_search 或带有 search 且不是 research 的工具
-      return n.includes('tavily') && isNotOther && (n.endsWith('search') || n.includes('search_') || n.includes('_search'));
+      const isExcluded = /research|crawl|map|extract/.test(n);
+      const isTavilySearch = n.includes('tavily') && /search/.test(n);
+      return isTavilySearch && !isExcluded;
     }) || allTools.find(t => {
       const n = getToolName(t);
-      return n.includes('tavily') && !n.includes('research') && !n.includes('crawl') && !n.includes('map') && !n.includes('extract');
+      return n.includes('tavily') && !/research|crawl|map|extract/.test(n);
     });
-
+  
     // 2. 精准匹配 Serper / Google 搜索
     const serperSearchTool = allTools.find(t => {
       const n = getToolName(t);
-      return (n.includes('serper') || n.includes('google')) && !n.includes('crawl') && !n.includes('research');
+      return (n.includes('serper') || n.includes('google')) && !/research|crawl/.test(n);
     });
-
-    // 3. 通用搜索兜底（必须排除 research 以及系统的文件/命令工具）
+  
+    // 3. 通用搜索兜底（排除 research 以及常见系统工具）
     const fallbackSearchTool = allTools.find(t => {
       const n = getToolName(t);
-      return (n.endsWith('search') || n.includes('_search') || n.includes('search_')) && 
-             !n.includes('research') && 
-             !['bash', 'read', 'write', 'edit'].includes(n);
+      const isSearch = /search/.test(n) && !n.includes('research');
+      const isSystemTool = ['bash', 'read', 'write', 'edit', 'glob', 'grep'].some(sys => n.includes(sys));
+      return isSearch && !isSystemTool;
     });
-
+  
     // 4. 分流调度
     let targetTool = null;
     if (normAction === 'net_search2') {
       targetTool = serperSearchTool || tavilySearchTool || fallbackSearchTool;
       if (!targetTool) {
-        throw new Error(`CC 未挂载 Serper MCP 工具，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
+        throw new Error(`CC 未挂载 Serper MCP 工具，可用工具: ${allTools.map(getRealToolName).filter(Boolean).join(', ')}`);
       }
     } else {
       targetTool = tavilySearchTool || serperSearchTool || fallbackSearchTool;
       if (!targetTool) {
-        throw new Error(`CC 未挂载 Tavily 搜索 MCP (普通搜索，非 research)，可用工具: ${allTools.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
+        throw new Error(`CC 未挂载 Tavily 搜索 MCP (普通搜索，非 research)，可用工具: ${allTools.map(getRealToolName).filter(Boolean).join(', ')}`);
       }
     }
-
+  
     const realName = getRealToolName(targetTool);
     const lowerName = realName.toLowerCase();
-
+  
     // 5. 按工具精准装配入参
     let searchArgs = {};
-
+  
+    // 【修复点 1】：同时包含 serper 和 google
     if (lowerName.includes('serper') || lowerName.includes('google')) {
-      // Serper 严格入参
+      // 【修复点 2】：q 和 query 同时传，且必须提供默认地区和语言兜底值，避免 MCP 报 required 错误
       searchArgs = {
         q: query,
         query: query,
-        country: params.country || 'cn',
-        gl: params.gl || 'cn',
-        region: params.region || 'cn',
-        region_code: params.region_code || 'cn',
-        language: params.language || 'zh-cn',
-        hl: params.hl || 'zh-cn',
-        language_code: params.language_code || 'zh-cn'
+        country: params.country || params.gl || params.region || 'cn',
+        gl: params.gl || params.country || params.region || 'cn',
+        language: params.language || params.hl || 'zh-cn',
+        hl: params.hl || params.language || 'zh-cn'
       };
     } else if (lowerName.includes('research')) {
-      // 如果万一确实只有 research 工具可用，则补上它要求的 input 字段防报错
-      searchArgs = {
-        input: query,
-        query: query
-      };
+      // 兜底进入 research 时使用 input
+      searchArgs = { input: query };
     } else {
-      // Tavily 普通 search 纯净入参
+      // Tavily 普通搜索纯净入参
       searchArgs = {
-        query: query
+        query: query,
+        ...(params.max_results ? { max_results: Number(params.max_results) } : {}),
+        ...(params.search_depth ? { search_depth: params.search_depth } : {})
       };
     }
-
+  
     return {
       name: realName,
       arguments: searchArgs
     };
   }
-
+  
+      // ==========================================
+    // 网页抓取：用 Bash + curl 替代 WebFetch，彻底绕过官方模型的版权总结截断
     // ==========================================
-  // 网页抓取：用 Bash + curl 替代 WebFetch，彻底绕过官方模型的版权总结截断
-  // ==========================================
-  if (normAction === 'net_fetch' || normAction === 'net_fetch2' || normAction === 'webfetch') {
-    let targetUrl = params.url || '';
-    
-    // 统一走 Jina Reader 提取纯净 Markdown 正文
-    if (!targetUrl.startsWith('https://r.jina.ai/')) {
-      targetUrl = `https://r.jina.ai/${targetUrl}`;
-    }
-
-    // 映射为 Bash 命令，直接 curl 抓取全文，防止 Claude Code 官方模型概括截断
-    return {
-      name: 'Bash',
-      arguments: {
-        command: `curl -sL "${targetUrl}" | head -n 500`, // head 防止超大网页爆内存，通常古籍全文足够容纳
-        description: `抓取网页全文: ${params.url || ''}`
+    if (normAction === 'net_fetch' || normAction === 'net_fetch2' || normAction === 'webfetch') {
+      let targetUrl = params.url || '';
+      
+      // 统一走 Jina Reader 提取纯净 Markdown 正文
+      if (!targetUrl.startsWith('https://r.jina.ai/')) {
+        targetUrl = `https://r.jina.ai/${targetUrl}`;
       }
-    };
-  }
+  
+      // 映射为 Bash 命令，直接 curl 抓取全文，防止 Claude Code 官方模型概括截断
+      return {
+        name: 'Bash',
+        arguments: {
+          command: `curl -sL "${targetUrl}" | head -n 500`, // head 防止超大网页爆内存，通常古籍全文足够容纳
+          description: `抓取网页全文: ${params.url || ''}`
+        }
+      };
+    }
 
   // if (normAction === 'net_search' || normAction === 'websearch') {
   //   return { name: 'WebSearch', arguments: { query: params.query || '' } };
@@ -898,45 +898,44 @@ function compressHistorySteps(rawSteps) {
     const isTodoFile = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(filePathStr);
     const isReadmeFile = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(filePathStr);
 
-    // 注意：这里用原始索引算 age，不用 renderIdx
+        // 计算当前步骤距离最新一步相隔多少轮（0 代表当前最新，1 代表上一轮，2 代表上上轮...）
     const stepAge = latestOriginalIdx - originalIdx;
-    const isLatestStep = originalIdx === latestOriginalIdx;
+    
+    // 【核心定义】：最近 4 轮内的操作定义为“活跃窗口期”（保留原汁原味）
+    // 包含当前步 + 往前 3 步，共 4 步，足以覆盖 3-4 个文件的连续读取与交叉比对
+    const isInRecentWindow = stepAge <= 3; 
 
     const retention = classifyStepRetention(step.action, params, feedback);
 
-    if (step.action === 'fs_read') {
+    // ==========================================
+    // 1. 最近 4 轮内的步骤：绝对不截断、不折叠，保全完整内容供比对！
+    // ==========================================
+    if (isInRecentWindow) {
+      feedback = sanitizeWhitespace(String(feedback));
+    } 
+    // ==========================================
+    // 2. 超过 4 轮之前的陈旧步骤：才按原规则进行折叠和智能压缩
+    // ==========================================
+    else if (step.action === 'fs_read') {
       const lowerPath = filePathStr.toLowerCase();
       const latestReadOriginalIdx = lastReadOriginalMap.get(lowerPath);
 
-      // 最后一步：不管是什么，绝不压缩
-      if (isLatestStep) {
-        feedback = sanitizeWhitespace(String(feedback));
-      }
-      // 普通文件读取：后面有同文件更新读取，则旧的折叠
-      else if (
+      // 普通文件读取：如果后面有同文件的更新读取，且已经超出活跃窗口，旧的才折叠
+      if (
         latestReadOriginalIdx !== undefined &&
         latestReadOriginalIdx > originalIdx &&
         !isTodoFile &&
         !isReadmeFile
       ) {
         feedback = `[早期版本已读取，后续有同文件最新读取结果，此处折叠。文件：${filePathStr}]`;
-      }
-      // 其他读取正常压缩
-      else {
-        feedback = formatLocalFeedback(feedback, 'fs_read', params, isLatestStep, stepAge);
+      } else {
+        feedback = formatLocalFeedback(feedback, 'fs_read', params, false, stepAge);
       }
     } else {
-      // 最后一步：不管是什么，绝不压缩
-      if (isLatestStep) {
-        feedback = sanitizeWhitespace(String(feedback));
-      } else {
-        feedback = formatLocalFeedback(feedback, step.action, params, isLatestStep, stepAge);
-      }
+      feedback = formatLocalFeedback(feedback, step.action, params, false, stepAge);
     }
 
     return `--- Step ${renderIdx + 1} / 原始第 ${originalIdx + 1} 步 ---
-【保留级别】：${retention.tier}
-【保留原因】：${retention.reason}
 【执行配置】：
 ${JSON.stringify({
   action: step.action,
