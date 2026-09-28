@@ -175,43 +175,63 @@ function mapActionToClaudeCodeTool(actionName, rawParams, tools = []) {
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
 
-    // ==========================================
-  // 网络搜索：net_search (Tavily) 与 net_search2 (Serper)
+  // ==========================================
+  // 网络搜索：net_search (主搜索) 与 net_search2 (备用搜索)
   // ==========================================
   if (normAction === 'net_search' || normAction === 'net_search2' || normAction === 'websearch') {
     const query = params.query || params.q || '';
 
-    // 【核心修复】：兼容 Claude 格式 (t.name) 与 OpenAI 格式 (t.function.name)
     const getToolName = (t) => (t?.name || t?.function?.name || '').toLowerCase();
     const getRealToolName = (t) => t?.name || t?.function?.name || '';
 
-    // 1. 动态搜寻 CC 当前注入的所有工具
-    const tavilyTool = tools?.find(t => getToolName(t).includes('tavily'));
+    // 1. 过滤出 CC 挂载的所有具备搜索能力的工具（排除内置的 bash/read/write/edit 等）
+    const searchTools = tools?.filter(t => {
+      const n = getToolName(t);
+      return !['bash', 'read', 'write', 'edit', 'agent', 'notebookedit', 'askuserquestion'].includes(n) &&
+             (n.includes('search') || n.includes('serper') || n.includes('tavily') || n.includes('google') || n.includes('web'));
+    }) || [];
 
-    const serperTool = tools?.find(t => {
+    // 2. 精准定位 Tavily 与 Serper
+    const tavilyTool = searchTools.find(t => getToolName(t).includes('tavily'));
+    const serperTool = searchTools.find(t => {
       const n = getToolName(t);
       return n.includes('serper') || n.includes('google');
     });
 
-    // 2. 根据动作进行分流调度
+    // 3. 区分主搜与备用搜：net_search 走主搜，net_search2 走备用搜
+    let targetTool = null;
     if (normAction === 'net_search2') {
-      const targetTool = serperTool || tavilyTool;
-      if (!targetTool) {
-        throw new Error(`CC 未挂载 Serper 或 Tavily MCP 工具，可用工具列表: ${tools?.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
-      }
-      return {
-        name: getRealToolName(targetTool), // 取出真实的完整工具名
-        arguments: { query, q: query }
-      };
+      // 备用优先：Serper -> searchTools[1] -> Tavily -> searchTools[0]
+      targetTool = serperTool || searchTools[1] || tavilyTool || searchTools[0];
+    } else {
+      // 默认优先：Tavily -> searchTools[0] -> Serper -> searchTools[1]
+      targetTool = tavilyTool || searchTools[0] || serperTool || searchTools[1];
     }
-    // 默认 net_search
-    const targetTool = tavilyTool || serperTool;
+
     if (!targetTool) {
       throw new Error(`CC 未挂载任何搜索 MCP，可用工具列表: ${tools?.map(t => getRealToolName(t)).filter(Boolean).join(', ')}`);
     }
+
+    const realName = getRealToolName(targetTool);
+    const lowerName = realName.toLowerCase();
+
+    // 4. 【核心修复】：为 Serper/Google 类搜索补齐必须的 region 和 language 参数
+    const searchArgs = {
+      query,
+      q: query,
+      // 补全 Serper 必须的地区与语言入参，同时兼容各种常见别名
+      country: params.country || 'cn',
+      gl: params.gl || 'cn',
+      region: params.region || 'cn',
+      region_code: params.region_code || 'cn',
+      language: params.language || 'zh-cn',
+      hl: params.hl || 'zh-cn',
+      language_code: params.language_code || 'zh-cn'
+    };
+
     return {
-      name: getRealToolName(targetTool),
-      arguments: { query, q: query }
+      name: realName,
+      arguments: searchArgs
     };
   }
 
@@ -1217,9 +1237,9 @@ function buildPrompt(globalTask, historyLogsText) {
    - git_worktree: {"action": "enter|exit", "path": "隔离工作区路径"}
 3. 网络与知识检索：
    - net_search: {"query": "搜索词"}（默认快速检索）
-   - net_search2: {"query": "搜索词"}（当需要搜古典古籍、中文冷门资料或 net_search 结果不理想时优先使用）
+   - net_search2: {"query": "搜索词"}（备用联网搜索）
    - net_fetch: {"url": "网址", "prompt": "提取目标"}（常规网页读取）
-   - net_fetch2: {"url": "网址", "prompt": "提取目标"}（当 net_fetch 遇到 403、反爬盾、无法访问或要求提取复杂长文本时使用）
+   - net_fetch2: {"url": "网址", "prompt": "提取目标"}（备用网页读取）
 4. 任务编排与治理：
    - task_entry: {"action": "create|update", "title": "任务名", "status": "pending|completed"}
    - subflow_spawn: {"title": "子任务名", "instructions": "分派执行说明"}
@@ -1267,6 +1287,7 @@ ${historyLogsText}
 【普通推进规则】：
 - 若不清楚任务情况，读取本地 readme.md 内容。
 - 若尚未初始化，输出生成详尽 todo.md 的单一配置。
+- 若历史记录中某个搜索工具报错（如参数错误、网络失败、无结果），禁止用相同工具重复搜索同一关键词，必须立即切换到备用搜索动作（如从 net_search2 切换至 net_search，或更换检索关键词）。
 - 若历史里有用户问答结果，必须按用户选择继续推进，不要丢失用户决策。
 - 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
 - 每完成一项，在todo.md中打勾。
