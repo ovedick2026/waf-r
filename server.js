@@ -1543,7 +1543,8 @@ async function* readSSE(response) {
     }
     if (buffer.trim()) yield buffer.replace(/^data:\s*/, '');
   } finally {
-    reader.releaseLock();
+    try { await reader.cancel(); } catch {}
+    try { reader.releaseLock(); } catch {}
   }
 }
 
@@ -1561,7 +1562,8 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
     'Accept': 'text/event-stream, application/json'
   };
 
-  const skipMessagesProbe = (messagesEndpointUnsupportedUntil.get(targetBase) || 0) > Date.now();
+  // const skipMessagesProbe = (messagesEndpointUnsupportedUntil.get(targetBase) || 0) > Date.now();
+  const skipMessagesProbe = true;
 
   if (!skipMessagesProbe) {
     try {
@@ -1626,7 +1628,11 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 
   if (!chatRes.ok) {
     const errText = await chatRes.text();
-    throw new Error(`上游调用完全失败: HTTP ${chatRes.status} - ${errText}`);
+    const e = new Error(`上游调用完全失败: HTTP ${chatRes.status} - ${errText.slice(0, 500)}`);
+    e.status = chatRes.status;
+    const ra = Number(chatRes.headers.get('retry-after'));
+    if (ra > 0) e.retryAfterMs = ra * 1000;
+    throw e;
   }
 
   let fullText = '';
@@ -1680,6 +1686,68 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
     } catch {}
   }
   return { text: fullText, thinking: thinkingText };
+}
+
+// ==========================================
+// 上游重试：连续失败 UPSTREAM_MAX_ATTEMPTS 次才向下游报错
+// ==========================================
+const UPSTREAM_MAX_ATTEMPTS = Number(process.env.UPSTREAM_MAX_ATTEMPTS || 3);        // 总尝试次数（想"首次+重试3次"就设成4）
+const UPSTREAM_RETRY_BASE_MS = Number(process.env.UPSTREAM_RETRY_BASE_MS || 1000);   // 退避基数：1s, 2s, 4s...
+const UPSTREAM_ATTEMPT_TIMEOUT_MS = Number(process.env.UPSTREAM_ATTEMPT_TIMEOUT_MS || 20 * 60 * 1000); // 单次尝试总超时，0 关闭
+
+function isRetryableUpstreamError(err) {
+  if (err?.nonRetryable) return false;
+  const s = err?.status;
+  if (s) return s === 408 || s === 409 || s === 425 || s === 429 || s >= 500;
+  return true; // 无状态码：网络错误、超时、空响应、解析失败，都重试
+}
+
+function sleepAbortable(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error('aborted'));
+    const onAbort = () => { clearTimeout(t); reject(new Error('aborted')); };
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function withUpstreamRetry(task, { signal, label = '上游调用' } = {}) {
+  const max = Math.max(1, UPSTREAM_MAX_ATTEMPTS);
+  let lastErr;
+  let attempt = 0;
+
+  while (attempt < max) {
+    attempt++;
+    const signals = [signal];
+    if (UPSTREAM_ATTEMPT_TIMEOUT_MS > 0) signals.push(AbortSignal.timeout(UPSTREAM_ATTEMPT_TIMEOUT_MS));
+    const attemptSignal = typeof AbortSignal.any === 'function'
+      ? AbortSignal.any(signals.filter(Boolean))
+      : signal;
+
+    try {
+      return await task(attemptSignal, attempt);
+    } catch (err) {
+      lastErr = err;
+      if (signal?.aborted) throw err; // 下游已断开，不再重试
+      if (!isRetryableUpstreamError(err) || attempt >= max) break;
+
+      const backoff = UPSTREAM_RETRY_BASE_MS * 2 ** (attempt - 1);
+      const delay = Math.min(
+        err.retryAfterMs || backoff + Math.floor(Math.random() * 500),
+        30000
+      );
+      logger.error(`${label}失败（第 ${attempt}/${max} 次），${delay}ms 后重试`, err.message);
+      await sleepAbortable(delay, signal);
+    }
+  }
+
+  if (lastErr && attempt > 1) {
+    lastErr.message = `${lastErr.message}（已连续尝试 ${attempt} 次）`;
+  }
+  throw lastErr;
 }
 
 // ==========================================
@@ -2024,21 +2092,32 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   }
 
   try {
-    const { text: assistantText, thinking: assistantThinking } = await fetchUpstreamStream(
-      upstreamBase,
-      apiKey,
-      model,
-      prompt,
-      (chunk) => { upstreamThinkingChars += chunk.length; },
-      upstreamAbort.signal
-    );
+    const { safeAssistantText, parsedAction } = await withUpstreamRetry(async (attemptSignal) => {
+      const { text, thinking } = await fetchUpstreamStream(
+        upstreamBase,
+        apiKey,
+        model,
+        prompt,
+        (chunk) => { upstreamThinkingChars += chunk.length; },
+        attemptSignal
+      );
+
+      const safe = assertNonEmptyUpstreamText(text, isCompacting ? '历史压缩' : '任务调度');
+
+      if (isCompacting) {
+        const t = safe.replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '').trim();
+        if (!t) throw new Error('上游 LLM 历史压缩结果为空');
+        return { safeAssistantText: safe, parsedAction: null };
+      }
+
+      const parsed = extractActionAndThought(safe, thinking);
+      if (!parsed || !parsed.action) {
+        throw new Error(`上游 LLM 输出无法解析为有效调度动作。原始输出：${safe.slice(0, 500)}`);
+      }
+      return { safeAssistantText: safe, parsedAction: parsed };
+    }, { signal: upstreamAbort.signal, label: 'v1/messages 上游调用' });
 
     clearTimers();
-    
-    const safeAssistantText = assertNonEmptyUpstreamText(
-      assistantText,
-      isCompacting ? '历史压缩' : '任务调度'
-    );
     
     let stopReason = 'end_turn';
     let textContent = '';
@@ -2055,7 +2134,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     
       stopReason = 'end_turn';
     } else {
-      const parsedAction = extractActionAndThought(safeAssistantText, assistantThinking);
+      // const parsedAction = extractActionAndThought(safeAssistantText, assistantThinking);
     
       if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
         const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params, tools);
@@ -2183,11 +2262,15 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 
     logger.error('Claude Code 消息通道异常', err.message);
 
+    const httpStatus = (err.status >= 400 && err.status < 600) ? err.status : 500;
+
     finished = true;
     if (!stream) {
-      sendJson(res, 500, { type: 'error', error: { type: 'api_error', message: err.message } });
+      // sendJson(res, 500, { type: 'error', error: { type: 'api_error', message: err.message } });
+      sendJson(res, httpStatus, { type: 'error', error: { type: 'api_error', message: err.message } });
     } else if (!res.headersSent) {
-      res.status(500).json({ error: { message: err.message } });
+      // res.status(500).json({ error: { message: err.message } });
+      res.status(httpStatus).json({ error: { message: err.message } });
     } else {
       // 流已经打开：按 Anthropic SSE 规范发一个 error 事件再关闭，CC 会把它当作一次可重试的 API 错误。
       // 原来是直接 res.end()，CC 会判定为"连接中断、响应被截断"，然后追加一句
@@ -2398,19 +2481,19 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       实际上游Prompt估算Token: requestInputTokens
     });
 
-    const { text: assistantText, thinking: assistantThinking } = await fetchUpstreamStream(
-      upstreamBase,
-      apiKey,
-      model,
-      prompt,
-      null,
-      upstreamAbort.signal
-    );
+    const { safeAssistantText, parsedAction } = await withUpstreamRetry(async (attemptSignal) => {
+      const { text, thinking } = await fetchUpstreamStream(
+        upstreamBase, apiKey, model, prompt, null, attemptSignal
+      );
+      const safe = assertNonEmptyUpstreamText(text, '任务调度');
+      const parsed = extractActionAndThought(safe, thinking);
+      if (!parsed || !parsed.action) {
+        throw new Error(`上游 LLM 输出无法解析为有效调度动作。原始输出：${safe.slice(0, 500)}`);
+      }
+      return { safeAssistantText: safe, parsedAction: parsed };
+    }, { signal: upstreamAbort.signal, label: 'chat/completions 上游调用' });
 
     clearTimers();
-
-    const safeAssistantText = assertNonEmptyUpstreamText(assistantText, '任务调度');
-    const parsedAction = extractActionAndThought(safeAssistantText, assistantThinking);
     
     const callId = 'call_' + crypto.randomBytes(8).toString('hex');
     let toolCalls = null;
@@ -2564,6 +2647,13 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   }
 });
 
+app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  res.status(err.status || 400).json({ type: 'error', error: { type: 'invalid_request_error', message: err.message } });
+});
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
   console.log(` CC 已就绪 (端口: ${PORT})`);
@@ -2573,3 +2663,14 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 server.requestTimeout = 2400000;
 server.headersTimeout = 2400000;
 server.keepAliveTimeout = 120000;
+
+process.on('unhandledRejection', (r) => logger.error('unhandledRejection', r));
+process.on('uncaughtException', (e) => logger.error('uncaughtException', e));
+
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    logger.error(`收到 ${sig}，停止接收新连接`, '');
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 30000).unref();
+  });
+}
